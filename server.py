@@ -377,6 +377,101 @@ async def login(data: UserLogin):
     
     return TokenResponse(access_token=token, user=user_to_response(user))
 
+# -----------------------------------------------------------------------------
+# PASSWORD RECOVERY
+# -----------------------------------------------------------------------------
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(data: ForgotPasswordRequest):
+    """Invia codice di recupero password via email"""
+    user = await db.users.find_one({"email": data.email.lower()})
+    
+    if not user:
+        # Per sicurezza non riveliamo se l'email esiste o no
+        return {"message": "Se l'email esiste, riceverai un codice di recupero"}
+    
+    code = generate_verification_code()
+    expires_at = datetime.utcnow() + timedelta(minutes=15)
+    
+    await db.password_resets.update_one(
+        {"email": data.email.lower()},
+        {
+            "$set": {
+                "email": data.email.lower(),
+                "code": code,
+                "expires_at": expires_at,
+                "created_at": datetime.utcnow()
+            }
+        },
+        upsert=True
+    )
+    
+    # Invia email con codice
+    try:
+        if RESEND_API_KEY:
+            resend.emails.send({
+                "from": "Lumina Ingegno <noreply@updates.raffaeleingegno.com>",
+                "to": data.email,
+                "subject": "Recupero Password - Lumina Ingegno",
+                "html": f"""
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                    <h2 style="color: #cc3333;">Recupero Password</h2>
+                    <p>Ciao {user.get('name', '')},</p>
+                    <p>Hai richiesto di reimpostare la tua password.</p>
+                    <p>Il tuo codice di recupero è:</p>
+                    <div style="background: #f5f5f5; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
+                        {code}
+                    </div>
+                    <p>Il codice scade tra 15 minuti.</p>
+                    <p>Se non hai richiesto tu il recupero password, ignora questa email.</p>
+                    <p style="color: #888; font-size: 12px;">Team Lumina Ingegno</p>
+                </div>
+                """
+            })
+            logger.info(f"Password reset email sent to {data.email}")
+    except Exception as e:
+        logger.error(f"Error sending reset email: {e}")
+    
+    return {"message": "Se l'email esiste, riceverai un codice di recupero"}
+
+@app.post("/api/auth/reset-password")
+async def reset_password(data: ResetPasswordRequest):
+    """Reimposta la password usando il codice di recupero"""
+    reset_request = await db.password_resets.find_one({"email": data.email.lower()})
+    
+    if not reset_request:
+        raise HTTPException(status_code=400, detail="Richiesta di recupero non trovata")
+    
+    if reset_request.get("code") != data.code:
+        raise HTTPException(status_code=400, detail="Codice non valido")
+    
+    if datetime.utcnow() > reset_request.get("expires_at", datetime.utcnow()):
+        raise HTTPException(status_code=400, detail="Codice scaduto")
+    
+    # Aggiorna la password dell'utente (mantiene tutti gli altri dati del profilo)
+    result = await db.users.update_one(
+        {"email": data.email.lower()},
+        {"$set": {"password_hash": hash_password(data.new_password)}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Utente non trovato")
+    
+    # Elimina la richiesta di reset
+    await db.password_resets.delete_one({"email": data.email.lower()})
+    
+    logger.info(f"Password reset successful for {data.email}")
+    
+    return {"message": "Password reimpostata con successo"}
+
 @app.get("/api/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
     return user_to_response(current_user)
