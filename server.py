@@ -86,6 +86,7 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str
     name: str
+    referral_used: Optional[str] = None  # Codice referral usato in registrazione
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -257,6 +258,13 @@ async def register(user: UserCreate):
     if existing and existing.get("is_verified"):
         raise HTTPException(status_code=400, detail="Email già registrata")
     
+    # Verifica codice referral se fornito
+    referrer = None
+    if user.referral_used:
+        referrer = await db.users.find_one({"referral_code": user.referral_used.upper()})
+        if not referrer:
+            raise HTTPException(status_code=400, detail="Codice referral non valido")
+    
     code = generate_verification_code()
     expires_at = datetime.utcnow() + timedelta(minutes=10)
     
@@ -267,6 +275,7 @@ async def register(user: UserCreate):
                 "email": user.email.lower(),
                 "password_hash": hash_password(user.password),
                 "name": user.name,
+                "referral_used": user.referral_used.upper() if user.referral_used else None,
                 "verification_code": code,
                 "code_expires_at": expires_at,
                 "created_at": datetime.utcnow()
@@ -294,16 +303,51 @@ async def verify_registration(data: VerifyCode):
     user_id = generate_user_id()
     is_admin = data.email.lower() == ADMIN_EMAIL.lower()
     
+    # Gestione bonus referral
+    referral_used = pending.get("referral_used")
+    tutorials_access_expires = None
+    referral_bonus_received = False
+    
+    if referral_used:
+        # Trova chi ha condiviso il codice
+        referrer = await db.users.find_one({"referral_code": referral_used})
+        if referrer:
+            # Controlla se il referrer ha già ricevuto il bonus (max 1 volta)
+            if not referrer.get("referral_bonus_given"):
+                # Dai 1 mese di tutorial gratis al referrer
+                referrer_expires = referrer.get("tutorials_access_expires") or datetime.utcnow()
+                if referrer_expires < datetime.utcnow():
+                    referrer_expires = datetime.utcnow()
+                new_referrer_expires = referrer_expires + timedelta(days=30)
+                
+                await db.users.update_one(
+                    {"user_id": referrer["user_id"]},
+                    {"$set": {
+                        "tutorials_access_expires": new_referrer_expires,
+                        "referral_bonus_given": True
+                    }}
+                )
+                logger.info(f"Referral bonus given to {referrer['email']}")
+            
+            # Dai 1 mese di tutorial gratis al nuovo utente
+            tutorials_access_expires = datetime.utcnow() + timedelta(days=30)
+            referral_bonus_received = True
+            logger.info(f"Referral bonus received by {data.email}")
+    
     user = {
         "user_id": user_id,
         "email": data.email.lower(),
         "password_hash": pending.get("password_hash"),
         "name": pending.get("name"),
         "referral_code": generate_referral_code(),
+        "referral_used": referral_used,
+        "referral_bonus_received": referral_bonus_received,
+        "referral_bonus_given": False,
         "is_admin": is_admin,
         "is_verified": True,
         "plan": "free",
         "purchases": [],
+        "tutorials_access_expires": tutorials_access_expires,
         "created_at": datetime.utcnow()
     }
     
