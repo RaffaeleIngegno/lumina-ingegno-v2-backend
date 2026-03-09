@@ -120,6 +120,13 @@ class PurchaseVerify(BaseModel):
     purchase_token: str
     platform: str = "android"
 
+class TutorialCreate(BaseModel):
+    title: str
+    description: str = ""
+    image_url: str = ""
+    url: str
+    is_free: bool = False
+
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
@@ -580,6 +587,54 @@ async def delete_book(book_id: str, admin: dict = Depends(get_admin_user)):
         raise HTTPException(status_code=404, detail="Libro non trovato")
     return {"message": "Libro eliminato"}
 
+# Tutorial Admin Endpoints
+def generate_tutorial_id() -> str:
+    return f"tutorial_{secrets.token_hex(6)}"
+
+@app.post("/api/admin/tutorials")
+async def create_tutorial(tutorial: TutorialCreate, admin: dict = Depends(get_admin_user)):
+    tutorial_data = {
+        "tutorial_id": generate_tutorial_id(),
+        "title": tutorial.title,
+        "description": tutorial.description,
+        "image_url": tutorial.image_url,
+        "url": tutorial.url,
+        "is_free": tutorial.is_free,
+        "created_at": datetime.utcnow()
+    }
+    await db.tutorials.insert_one(tutorial_data)
+    return tutorial_data
+
+@app.put("/api/admin/tutorials/{tutorial_id}")
+async def update_tutorial(tutorial_id: str, tutorial: TutorialCreate, admin: dict = Depends(get_admin_user)):
+    result = await db.tutorials.update_one(
+        {"tutorial_id": tutorial_id},
+        {"$set": {
+            "title": tutorial.title,
+            "description": tutorial.description,
+            "image_url": tutorial.image_url,
+            "url": tutorial.url,
+            "is_free": tutorial.is_free
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Tutorial non trovato")
+    return {"message": "Tutorial aggiornato"}
+
+@app.delete("/api/admin/tutorials/{tutorial_id}")
+async def delete_tutorial(tutorial_id: str, admin: dict = Depends(get_admin_user)):
+    result = await db.tutorials.delete_one({"tutorial_id": tutorial_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Tutorial non trovato")
+    return {"message": "Tutorial eliminato"}
+
+@app.get("/api/admin/tutorials")
+async def get_all_tutorials(admin: dict = Depends(get_admin_user)):
+    tutorials = await db.tutorials.find().to_list(100)
+    return [{"tutorial_id": t.get("tutorial_id"), "title": t.get("title"), 
+             "description": t.get("description"), "url": t.get("url"),
+             "image_url": t.get("image_url"), "is_free": t.get("is_free", False)} for t in tutorials]
+
 # =============================================================================
 # ADMIN WEB PANEL
 # =============================================================================
@@ -658,6 +713,7 @@ ADMIN_HTML = """
                 <div class="tab active" onclick="showTab('notifications')">📢 Notifiche</div>
                 <div class="tab" onclick="showTab('users')">👥 Utenti</div>
                 <div class="tab" onclick="showTab('books')">📚 Libri</div>
+                <div class="tab" onclick="showTab('tutorials')">🎓 Tutorial</div>
             </div>
 
             <!-- Notifications Tab -->
@@ -691,6 +747,29 @@ ADMIN_HTML = """
                     <div>
                         <h3 style="margin-bottom: 15px;">Libri Esistenti</h3>
                         <div id="booksList"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tutorials Tab -->
+            <div id="tutorialsTab" class="card hidden">
+                <h2>🎓 Gestione Tutorial</h2>
+                <div class="grid">
+                    <div>
+                        <h3 style="margin-bottom: 15px;">Aggiungi Nuovo Tutorial</h3>
+                        <input type="text" id="tutorialTitle" placeholder="Titolo">
+                        <input type="text" id="tutorialDesc" placeholder="Descrizione">
+                        <input type="text" id="tutorialImage" placeholder="URL Immagine">
+                        <input type="text" id="tutorialUrl" placeholder="URL Pagina Tutorial">
+                        <label style="display: flex; align-items: center; gap: 10px; margin: 15px 0; cursor: pointer;">
+                            <input type="checkbox" id="tutorialFree" style="width: auto; margin: 0;">
+                            <span>Tutorial Gratuito</span>
+                        </label>
+                        <button class="btn" onclick="addTutorial()">Aggiungi Tutorial</button>
+                    </div>
+                    <div>
+                        <h3 style="margin-bottom: 15px;">Tutorial Esistenti</h3>
+                        <div id="tutorialsList"></div>
                     </div>
                 </div>
             </div>
@@ -823,6 +902,25 @@ ADMIN_HTML = """
             } catch (e) {
                 console.log('Error loading books');
             }
+
+            // Load tutorials
+            try {
+                const tutorialsRes = await fetch(API_URL + '/api/admin/tutorials', {
+                    headers: { 'Authorization': 'Bearer ' + authToken }
+                });
+                const tutorials = await tutorialsRes.json();
+                document.getElementById('tutorialsList').innerHTML = tutorials.length ? tutorials.map(t => `
+                    <div class="user-item">
+                        <div class="user-info">
+                            <div class="user-name">${t.title} ${t.is_free ? '<span class="badge badge-push">FREE</span>' : '<span class="badge badge-premium">PREMIUM</span>'}</div>
+                            <div class="user-email">${t.description || t.url}</div>
+                        </div>
+                        <button class="btn btn-secondary" onclick="deleteTutorial('${t.tutorial_id}')">🗑️</button>
+                    </div>
+                `).join('') : '<p style="color:#888">Nessun tutorial</p>';
+            } catch (e) {
+                console.log('Error loading tutorials');
+            }
         }
 
         async function sendNotification() {
@@ -887,6 +985,48 @@ ADMIN_HTML = """
             if (!confirm('Sei sicuro di voler eliminare questo libro?')) return;
             
             await fetch(API_URL + '/api/admin/books/' + bookId, {
+                method: 'DELETE',
+                headers: { 'Authorization': 'Bearer ' + authToken }
+            });
+            loadData();
+        }
+
+        async function addTutorial() {
+            const tutorial = {
+                title: document.getElementById('tutorialTitle').value,
+                description: document.getElementById('tutorialDesc').value,
+                image_url: document.getElementById('tutorialImage').value,
+                url: document.getElementById('tutorialUrl').value,
+                is_free: document.getElementById('tutorialFree').checked
+            };
+            
+            if (!tutorial.title || !tutorial.url) {
+                alert('Inserisci almeno titolo e URL');
+                return;
+            }
+            
+            await fetch(API_URL + '/api/admin/tutorials', {
+                method: 'POST',
+                headers: { 
+                    'Authorization': 'Bearer ' + authToken,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(tutorial)
+            });
+            
+            // Clear form and reload
+            document.getElementById('tutorialTitle').value = '';
+            document.getElementById('tutorialDesc').value = '';
+            document.getElementById('tutorialImage').value = '';
+            document.getElementById('tutorialUrl').value = '';
+            document.getElementById('tutorialFree').checked = false;
+            loadData();
+        }
+
+        async function deleteTutorial(tutorialId) {
+            if (!confirm('Sei sicuro di voler eliminare questo tutorial?')) return;
+            
+            await fetch(API_URL + '/api/admin/tutorials/' + tutorialId, {
                 method: 'DELETE',
                 headers: { 'Authorization': 'Bearer ' + authToken }
             });
