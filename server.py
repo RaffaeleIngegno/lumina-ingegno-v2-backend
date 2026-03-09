@@ -8,6 +8,7 @@ import os
 import secrets
 import string
 import logging
+import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -18,7 +19,6 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from motor.motor_asyncio import AsyncIOMotorClient
-from passlib.context import CryptContext
 from jose import JWTError, jwt
 import resend
 import httpx
@@ -41,9 +41,6 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 # JWT Config
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
-
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Security
 security = HTTPBearer(auto_error=False)
@@ -146,10 +143,13 @@ def generate_book_id() -> str:
     return f"book_{secrets.token_hex(6)}"
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    """Hash password using SHA256 with salt"""
+    salt = SECRET_KEY[:16]
+    return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    """Verify password against hash"""
+    return hash_password(plain_password) == hashed_password
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
