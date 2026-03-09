@@ -353,6 +353,42 @@ async def delete_account(current_user: dict = Depends(get_current_user)):
     return {"message": "Account eliminato con successo"}
 
 # -----------------------------------------------------------------------------
+# ADMIN PASSWORD RESET (one-time setup endpoint)
+# -----------------------------------------------------------------------------
+
+@app.post("/api/admin/reset-password")
+async def reset_admin_password(email: str = Form(...), password: str = Form(...)):
+    """Reset password for admin user - use once then remove"""
+    if email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Solo per admin")
+    
+    result = await db.users.update_one(
+        {"email": email.lower()},
+        {"$set": {"password_hash": hash_password(password), "is_admin": True, "is_verified": True}}
+    )
+    
+    if result.matched_count == 0:
+        # Create admin user if not exists
+        user = {
+            "user_id": generate_user_id(),
+            "email": email.lower(),
+            "password_hash": hash_password(password),
+            "name": "Admin",
+            "referral_code": generate_referral_code(),
+            "is_admin": True,
+            "is_verified": True,
+            "plan": "free",
+            "purchases": [],
+            "created_at": datetime.utcnow()
+        }
+        await db.users.insert_one(user)
+        logger.info(f"Admin user created: {email}")
+        return {"message": "Admin creato"}
+    
+    logger.info(f"Admin password reset: {email}")
+    return {"message": "Password aggiornata"}
+
+# -----------------------------------------------------------------------------
 # PUSH TOKEN ENDPOINTS
 # -----------------------------------------------------------------------------
 
