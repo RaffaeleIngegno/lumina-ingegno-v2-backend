@@ -1,7 +1,7 @@
 """
 Lumina Ingegno V2 - Backend API
 Configurato per Railway + MongoDB Atlas
-Include: Auth, Libri, IAP, Push Notifications, Admin Panel
+Include: Auth, Libri, IAP, Push Notifications (Firebase), Admin Panel, AI Tools
 """
 
 import os
@@ -9,13 +9,15 @@ import secrets
 import string
 import logging
 import hashlib
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional, List
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Depends, Form, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -23,6 +25,13 @@ from jose import JWTError, jwt
 import resend
 import httpx
 from dotenv import load_dotenv
+
+# Firebase Admin SDK
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+# OpenAI Integration
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -37,6 +46,7 @@ DB_NAME = os.getenv("DB_NAME", "lumina_v2")
 SECRET_KEY = os.getenv("SECRET_KEY", "fallback-secret-key")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "raffaeleingegno.com@gmail.com")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+EMERGENT_LLM_KEY = os.getenv("EMERGENT_LLM_KEY")
 
 # JWT Config
 ALGORITHM = "HS256"
@@ -48,6 +58,20 @@ security = HTTPBearer(auto_error=False)
 # Initialize Resend
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
+
+# Initialize Firebase Admin SDK
+FIREBASE_CREDS_PATH = Path(__file__).parent / "firebase-credentials.json"
+firebase_initialized = False
+if FIREBASE_CREDS_PATH.exists():
+    try:
+        cred = credentials.Certificate(str(FIREBASE_CREDS_PATH))
+        firebase_admin.initialize_app(cred)
+        firebase_initialized = True
+        logger.info("Firebase Admin SDK initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Firebase: {e}")
+else:
+    logger.warning(f"Firebase credentials not found at {FIREBASE_CREDS_PATH}")
 
 # MongoDB connection
 client = AsyncIOMotorClient(MONGO_URL)
@@ -112,6 +136,7 @@ class BookCreate(BaseModel):
     pdf_url: str
     price: float = 0
     product_id: str = "book_single"
+    sort_order: int = 1
 
 class PurchaseVerify(BaseModel):
     product_id: str
@@ -124,6 +149,12 @@ class TutorialCreate(BaseModel):
     image_url: str = ""
     url: str
     is_free: bool = False
+
+class HomeBadgeUpdate(BaseModel):
+    active: bool = False
+    text: str = ""
+    link: str = ""
+    auto_expire_24h: bool = False
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -223,22 +254,47 @@ async def send_verification_email(email: str, code: str, name: str):
         logger.error(f"Error sending email: {e}")
 
 # =============================================================================
-# PUSH NOTIFICATIONS
+# PUSH NOTIFICATIONS (Firebase Cloud Messaging)
 # =============================================================================
 
-async def send_expo_push(token: str, title: str, body: str, data: dict = None):
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://exp.host/--/api/v2/push/send",
-            json={
-                "to": token,
-                "title": title,
-                "body": body,
-                "sound": "default",
-                "data": data or {}
-            }
+async def send_fcm_push(token: str, title: str, body: str, data: dict = None) -> dict:
+    """Send push notification via Firebase Cloud Messaging"""
+    if not firebase_initialized:
+        logger.warning("Firebase not initialized - skipping push")
+        return {"success": False, "error": "Firebase not initialized"}
+    
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data=data or {},
+            token=token,
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    icon="notification_icon",
+                    color="#cc3333",
+                    sound="default",
+                ),
+            ),
         )
-        return response.json()
+        
+        response = messaging.send(message)
+        logger.info(f"FCM push sent successfully: {response}")
+        return {"success": True, "message_id": response}
+    except messaging.UnregisteredError:
+        logger.warning(f"FCM token unregistered: {token[:20]}...")
+        return {"success": False, "error": "Token unregistered"}
+    except Exception as e:
+        logger.error(f"FCM push error: {e}")
+        return {"success": False, "error": str(e)}
+
+# Legacy function for backward compatibility
+async def send_expo_push(token: str, title: str, body: str, data: dict = None):
+    """Legacy Expo push - now routes to FCM"""
+    return await send_fcm_push(token, title, body, data)
 
 # =============================================================================
 # API ENDPOINTS
@@ -247,6 +303,32 @@ async def send_expo_push(token: str, title: str, body: str, data: dict = None):
 @app.get("/api/health")
 async def health_check():
     return {"status": "healthy", "message": "Lumina Ingegno V2 API is running"}
+
+# Endpoint temporaneo per creare utente test (da rimuovere dopo)
+@app.post("/api/admin/create-test-user")
+async def create_test_user(secret: str, email: str, password: str, name: str, is_admin: bool = False):
+    if secret != "lumina-secret-2025":
+        raise HTTPException(status_code=403, detail="Non autorizzato")
+    
+    existing = await db.users.find_one({"email": email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email già esistente")
+    
+    user_id = generate_user_id()
+    user = {
+        "user_id": user_id,
+        "email": email.lower(),
+        "password_hash": hash_password(password),
+        "name": name,
+        "referral_code": generate_referral_code(),
+        "is_admin": is_admin,
+        "is_verified": True,
+        "plan": "free",
+        "purchases": [],
+        "created_at": datetime.utcnow()
+    }
+    await db.users.insert_one(user)
+    return {"message": "Utente creato", "user_id": user_id, "email": email}
 
 # -----------------------------------------------------------------------------
 # AUTH ENDPOINTS
@@ -357,6 +439,24 @@ async def verify_registration(data: VerifyCode):
     token = create_access_token({"sub": user_id})
     logger.info(f"User registered: {data.email}")
     
+    # Invia email notifica admin per nuova iscrizione
+    try:
+        resend.api_key = os.getenv("RESEND_API_KEY")
+        resend.Emails.send({
+            "from": "Lumina Ingegno <noreply@raffaeleingegno.com>",
+            "to": ["info@raffaeleingegno.com"],
+            "subject": f"Nuova Iscrizione: {data.name}",
+            "html": f"""
+            <h2>Nuovo utente registrato!</h2>
+            <p><strong>Nome:</strong> {data.name}</p>
+            <p><strong>Email:</strong> {data.email}</p>
+            <p><strong>Data:</strong> {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}</p>
+            <p><strong>Referral Code:</strong> {referral_code}</p>
+            """
+        })
+    except Exception as e:
+        logger.error(f"Error sending registration notification email: {e}")
+    
     return TokenResponse(access_token=token, user=user_to_response(user))
 
 @app.post("/api/auth/login", response_model=TokenResponse)
@@ -417,7 +517,7 @@ async def forgot_password(data: ForgotPasswordRequest):
     # Invia email con codice
     try:
         if RESEND_API_KEY:
-            resend.emails.send({
+            resend.Emails.send({
                 "from": "Lumina Ingegno <noreply@updates.raffaeleingegno.com>",
                 "to": data.email,
                 "subject": "Recupero Password - Lumina Ingegno",
@@ -531,15 +631,18 @@ async def reset_admin_password(email: str = Form(...), password: str = Form(...)
 # PUSH TOKEN ENDPOINTS
 # -----------------------------------------------------------------------------
 
+class PushTokenRequest(BaseModel):
+    token: str
+    platform: str = "android"
+
 @app.post("/api/push-token")
 async def register_push_token(
-    token: str = Form(...),
-    platform: str = Form(...),
+    data: PushTokenRequest,
     current_user: dict = Depends(get_current_user)
 ):
     await db.users.update_one(
         {"user_id": current_user["user_id"]},
-        {"$set": {"push_token": token, "push_platform": platform}}
+        {"$set": {"push_token": data.token, "push_platform": data.platform}}
     )
     logger.info(f"Push token registered for {current_user['email']}")
     return {"message": "Token registrato"}
@@ -550,22 +653,30 @@ async def register_push_token(
 
 @app.get("/api/books")
 async def get_books(current_user: dict = Depends(get_current_user)):
-    """Ottieni lista libri con stato accesso"""
-    books = await db.books.find().to_list(100)
+    """Ottieni lista libri con stato accesso, ordinati per sort_order"""
+    books = await db.books.find().sort("sort_order", 1).to_list(100)
     user_purchases = current_user.get("purchases", [])
     has_full_access = "books_full_access" in user_purchases
+    is_admin = current_user.get("is_admin", False)
     
     result = []
     for book in books:
+        # Verifica accesso tramite book_id o product_id
+        # L'ADMIN ha sempre accesso a tutti i libri
+        book_id = book.get("book_id")
+        product_id = book.get("product_id", "")
+        has_access = is_admin or has_full_access or book_id in user_purchases or product_id in user_purchases
+        
         book_data = {
-            "book_id": book.get("book_id"),
+            "book_id": book_id,
             "title": book.get("title"),
             "description": book.get("description"),
             "cover_url": book.get("cover_url"),
             "price": book.get("price", 0),
-            "has_access": has_full_access or book.get("book_id") in user_purchases,
+            "sort_order": book.get("sort_order", 999),
+            "has_access": has_access,
         }
-        if book_data["has_access"]:
+        if has_access:
             book_data["pdf_url"] = book.get("pdf_url")
         result.append(book_data)
     
@@ -580,7 +691,9 @@ async def get_book(book_id: str, current_user: dict = Depends(get_current_user))
     
     user_purchases = current_user.get("purchases", [])
     has_full_access = "books_full_access" in user_purchases
-    has_access = has_full_access or book_id in user_purchases
+    is_admin = current_user.get("is_admin", False)
+    product_id = book.get("product_id", "")
+    has_access = is_admin or has_full_access or book_id in user_purchases or product_id in user_purchases
     
     result = {
         "book_id": book.get("book_id"),
@@ -594,6 +707,30 @@ async def get_book(book_id: str, current_user: dict = Depends(get_current_user))
         result["pdf_url"] = book.get("pdf_url")
     
     return result
+
+@app.get("/api/books/{book_id}/pdf")
+async def get_book_pdf(book_id: str, current_user: dict = Depends(get_current_user)):
+    """Ottieni URL del PDF per un libro acquistato"""
+    book = await db.books.find_one({"book_id": book_id})
+    if not book:
+        raise HTTPException(status_code=404, detail="Libro non trovato")
+    
+    user_purchases = current_user.get("purchases", [])
+    has_full_access = "books_full_access" in user_purchases
+    is_admin = current_user.get("is_admin", False)
+    
+    # Verifica accesso: admin, full access, book_id diretto, o product_id (es. book_lux)
+    product_id = book.get("product_id", "")
+    has_access = is_admin or has_full_access or book_id in user_purchases or product_id in user_purchases
+    
+    if not has_access:
+        raise HTTPException(status_code=403, detail="Non hai accesso a questo libro")
+    
+    pdf_url = book.get("pdf_url")
+    if not pdf_url:
+        raise HTTPException(status_code=404, detail="PDF non disponibile")
+    
+    return {"pdf_url": pdf_url, "title": book.get("title")}
 
 # -----------------------------------------------------------------------------
 # IAP ENDPOINTS
@@ -693,6 +830,27 @@ async def get_blog():
     return [{"post_id": p.get("post_id"), "title": p.get("title"), "url": p.get("url"),
              "image_url": p.get("image_url"), "created_at": p.get("created_at")} for p in posts]
 
+@app.get("/api/latest-updates")
+async def get_latest_updates():
+    """Restituisce le date degli ultimi contenuti pubblicati per News, Tutorial e Blog"""
+    # Ultimo news
+    latest_news = await db.news.find_one(sort=[("created_at", -1)])
+    news_date = latest_news.get("created_at").isoformat() if latest_news and latest_news.get("created_at") else None
+    
+    # Ultimo tutorial
+    latest_tutorial = await db.tutorials.find_one(sort=[("created_at", -1)])
+    tutorial_date = latest_tutorial.get("created_at").isoformat() if latest_tutorial and latest_tutorial.get("created_at") else None
+    
+    # Ultimo blog post
+    latest_blog = await db.blog.find_one(sort=[("created_at", -1)])
+    blog_date = latest_blog.get("created_at").isoformat() if latest_blog and latest_blog.get("created_at") else None
+    
+    return {
+        "news": news_date,
+        "tutorials": tutorial_date,
+        "blog": blog_date
+    }
+
 # -----------------------------------------------------------------------------
 # ADMIN ENDPOINTS
 # -----------------------------------------------------------------------------
@@ -704,6 +862,8 @@ async def get_all_users(admin: dict = Depends(get_admin_user)):
         {
             **user_to_response(user),
             "has_push_token": bool(user.get("push_token")),
+            "purchases": user.get("purchases", []),
+            "gifts": user.get("gifts", []),
         }
         for user in users
     ]
@@ -725,20 +885,38 @@ async def send_notification_to_all(
     notification: PushNotification,
     admin: dict = Depends(get_admin_user)
 ):
+    """Send push notification to all users via Firebase Cloud Messaging"""
     users = await db.users.find({"push_token": {"$exists": True, "$ne": None}}).to_list(1000)
     
     sent = 0
     errors = 0
+    unregistered = 0
     
     for user in users:
         try:
-            await send_expo_push(user["push_token"], notification.title, notification.body)
-            sent += 1
+            result = await send_fcm_push(user["push_token"], notification.title, notification.body)
+            if result.get("success"):
+                sent += 1
+            elif result.get("error") == "Token unregistered":
+                unregistered += 1
+                # Optionally remove invalid token
+                await db.users.update_one(
+                    {"user_id": user["user_id"]},
+                    {"$unset": {"push_token": ""}}
+                )
+            else:
+                errors += 1
         except Exception as e:
             logger.error(f"Error sending push to {user['email']}: {e}")
             errors += 1
     
-    return {"sent": sent, "errors": errors, "total": len(users)}
+    return {
+        "sent": sent, 
+        "errors": errors, 
+        "unregistered": unregistered,
+        "total": len(users),
+        "message": f"Notifica inviata a {sent} utenti" if sent > 0 else "Nessuna notifica inviata"
+    }
 
 @app.post("/api/admin/books")
 async def create_book(book: BookCreate, admin: dict = Depends(get_admin_user)):
@@ -750,6 +928,7 @@ async def create_book(book: BookCreate, admin: dict = Depends(get_admin_user)):
         "pdf_url": book.pdf_url,
         "price": book.price,
         "product_id": book.product_id,
+        "sort_order": book.sort_order,
         "created_at": datetime.utcnow()
     }
     await db.books.insert_one(book_data)
@@ -757,10 +936,58 @@ async def create_book(book: BookCreate, admin: dict = Depends(get_admin_user)):
 
 @app.delete("/api/admin/books/{book_id}")
 async def delete_book(book_id: str, admin: dict = Depends(get_admin_user)):
+    # Solo il super admin può eliminare libri
+    if admin.get("email", "").lower() != SUPER_ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Solo il super admin può eliminare libri")
+    
     result = await db.books.delete_one({"book_id": book_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Libro non trovato")
     return {"message": "Libro eliminato"}
+
+@app.get("/api/admin/books")
+async def get_all_books_admin(admin: dict = Depends(get_admin_user)):
+    """Ottieni tutti i libri con tutti i dettagli (admin)"""
+    books = await db.books.find().sort("sort_order", 1).to_list(100)
+    return [{
+        "book_id": b.get("book_id"),
+        "title": b.get("title"),
+        "description": b.get("description"),
+        "cover_url": b.get("cover_url"),
+        "pdf_url": b.get("pdf_url"),
+        "product_id": b.get("product_id"),
+        "sort_order": b.get("sort_order", 999),
+    } for b in books]
+
+class BookUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    cover_url: Optional[str] = None
+    pdf_url: Optional[str] = None
+    product_id: Optional[str] = None
+    sort_order: Optional[int] = None
+
+@app.put("/api/admin/books/{book_id}")
+async def update_book(book_id: str, book: BookUpdate, admin: dict = Depends(get_admin_user)):
+    """Aggiorna un libro esistente"""
+    existing = await db.books.find_one({"book_id": book_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Libro non trovato")
+    
+    update_data = {k: v for k, v in book.dict().items() if v is not None}
+    if update_data:
+        await db.books.update_one({"book_id": book_id}, {"$set": update_data})
+    
+    updated = await db.books.find_one({"book_id": book_id})
+    return {
+        "book_id": updated.get("book_id"),
+        "title": updated.get("title"),
+        "description": updated.get("description"),
+        "cover_url": updated.get("cover_url"),
+        "pdf_url": updated.get("pdf_url"),
+        "product_id": updated.get("product_id"),
+        "sort_order": updated.get("sort_order"),
+    }
 
 # Tutorial Admin Endpoints
 def generate_tutorial_id() -> str:
@@ -778,6 +1005,8 @@ async def create_tutorial(tutorial: TutorialCreate, admin: dict = Depends(get_ad
         "created_at": datetime.utcnow()
     }
     await db.tutorials.insert_one(tutorial_data)
+    # Rimuovi _id per evitare errore JSON serialization
+    tutorial_data.pop('_id', None)
     return tutorial_data
 
 @app.put("/api/admin/tutorials/{tutorial_id}")
@@ -809,6 +1038,383 @@ async def get_all_tutorials(admin: dict = Depends(get_admin_user)):
     return [{"tutorial_id": t.get("tutorial_id"), "title": t.get("title"), 
              "description": t.get("description"), "url": t.get("url"),
              "image_url": t.get("image_url"), "is_free": t.get("is_free", False)} for t in tutorials]
+
+# -----------------------------------------------------------------------------
+# ADMIN USER MANAGEMENT
+# -----------------------------------------------------------------------------
+
+class AdminCreateUser(BaseModel):
+    email: str
+    password: str
+    name: str
+    is_admin: bool = False
+
+@app.post("/api/admin/create-user")
+async def admin_create_user(data: AdminCreateUser, admin: dict = Depends(get_admin_user)):
+    """Crea un nuovo utente dal pannello admin"""
+    email_lower = data.email.lower()
+    existing = await db.users.find_one({"email": email_lower})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email già esistente")
+    
+    user_id = generate_user_id()
+    user = {
+        "user_id": user_id,
+        "email": email_lower,
+        "password_hash": hash_password(data.password),
+        "name": data.name,
+        "referral_code": generate_referral_code(),
+        "is_admin": data.is_admin,
+        "is_verified": True,
+        "plan": "free",
+        "purchases": [],
+        "created_at": datetime.utcnow()
+    }
+    await db.users.insert_one(user)
+    logger.info(f"Admin created user: {email_lower}")
+    return {"message": "Utente creato", "user_id": user_id}
+
+# Email super admin protetto (non può essere modificato)
+SUPER_ADMIN_EMAIL = "raffaeleingegno.com@gmail.com"
+
+@app.post("/api/admin/toggle-admin/{user_id}")
+async def toggle_admin(user_id: str, admin: dict = Depends(get_admin_user)):
+    """Rende un utente admin o rimuove privilegi admin"""
+    user = await db.users.find_one({"user_id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Utente non trovato")
+    
+    # Protezione super admin - non può essere modificato
+    if user.get("email", "").lower() == SUPER_ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Impossibile modificare i privilegi del super admin")
+    
+    # Solo il super admin può creare/rimuovere altri admin
+    if admin.get("email", "").lower() != SUPER_ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Solo il super admin può modificare i privilegi admin")
+    
+    new_admin_status = not user.get("is_admin", False)
+    await db.users.update_one(
+        {"user_id": user_id},
+        {"$set": {"is_admin": new_admin_status}}
+    )
+    return {"message": f"Admin {'attivato' if new_admin_status else 'disattivato'}", "is_admin": new_admin_status}
+
+class GiftBook(BaseModel):
+    user_id: str
+    product_id: str
+
+@app.post("/api/admin/gift-book")
+async def gift_book(data: GiftBook, admin: dict = Depends(get_admin_user)):
+    """Regala un libro o pacchetto a un utente"""
+    user = await db.users.find_one({"user_id": data.user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Utente non trovato")
+    
+    gifts = user.get("gifts", [])
+    if data.product_id not in gifts:
+        gifts.append(data.product_id)
+        await db.users.update_one(
+            {"user_id": data.user_id},
+            {"$set": {"gifts": gifts}}
+        )
+    
+    logger.info(f"Admin gifted {data.product_id} to user {data.user_id}")
+    return {"message": f"Prodotto {data.product_id} regalato", "gifts": gifts}
+
+@app.post("/api/admin/revoke-gift")
+async def revoke_gift(data: GiftBook, admin: dict = Depends(get_admin_user)):
+    """Revoca un gift a un utente"""
+    user = await db.users.find_one({"user_id": data.user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Utente non trovato")
+    
+    gifts = user.get("gifts", [])
+    if data.product_id in gifts:
+        gifts.remove(data.product_id)
+        await db.users.update_one(
+            {"user_id": data.user_id},
+            {"$set": {"gifts": gifts}}
+        )
+    
+    logger.info(f"Admin revoked gift {data.product_id} from user {data.user_id}")
+    return {"message": f"Gift {data.product_id} revocato", "gifts": gifts}
+
+@app.post("/api/admin/export-users")
+async def export_users_email(admin: dict = Depends(get_admin_user)):
+    """Esporta lista utenti via email"""
+    users = await db.users.find().to_list(1000)
+    
+    # Costruisci la tabella HTML
+    rows = ""
+    for u in users:
+        purchases = ", ".join(u.get("purchases", [])) or "Nessuno"
+        gifts = ", ".join(u.get("gifts", [])) or "Nessuno"
+        rows += f"""
+        <tr>
+            <td style="padding: 8px; border: 1px solid #ddd;">{u.get("name", "")}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{u.get("email", "")}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{purchases}</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">{gifts}</td>
+        </tr>
+        """
+    
+    html_content = f"""
+    <html>
+    <body>
+        <h2>Export Utenti Lumina Ingegno</h2>
+        <p>Totale utenti: {len(users)}</p>
+        <table style="border-collapse: collapse; width: 100%;">
+            <thead>
+                <tr style="background-color: #cc3333; color: white;">
+                    <th style="padding: 10px; border: 1px solid #ddd;">Nome</th>
+                    <th style="padding: 10px; border: 1px solid #ddd;">Email</th>
+                    <th style="padding: 10px; border: 1px solid #ddd;">Acquisti</th>
+                    <th style="padding: 10px; border: 1px solid #ddd;">Gift</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows}
+            </tbody>
+        </table>
+    </body>
+    </html>
+    """
+    
+    try:
+        resend.api_key = os.getenv("RESEND_API_KEY")
+        resend.Emails.send({
+            "from": "Lumina Ingegno <noreply@raffaeleingegno.com>",
+            "to": ["info@raffaeleingegno.com"],
+            "subject": f"Export Utenti - {len(users)} utenti",
+            "html": html_content
+        })
+        return {"message": "Email inviata a info@raffaeleingegno.com"}
+    except Exception as e:
+        logger.error(f"Error sending export email: {e}")
+        raise HTTPException(status_code=500, detail="Errore nell'invio email")
+
+@app.post("/api/admin/apply-referral/{user_id}")
+async def admin_apply_referral(user_id: str, admin: dict = Depends(get_admin_user)):
+    """Applica il bonus referral a un utente (1 mese tutorial gratis)"""
+    user = await db.users.find_one({"user_id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Utente non trovato")
+    
+    # Aggiungi 1 mese di tutorial
+    current_sub = user.get("subscription_until")
+    if current_sub and current_sub > datetime.utcnow():
+        new_until = current_sub + timedelta(days=30)
+    else:
+        new_until = datetime.utcnow() + timedelta(days=30)
+    
+    await db.users.update_one(
+        {"user_id": user_id},
+        {"$set": {"subscription_until": new_until, "plan": "premium"}}
+    )
+    
+    return {"message": "Bonus referral applicato", "subscription_until": new_until.isoformat()}
+
+# -----------------------------------------------------------------------------
+# ADMIN NEWS ENDPOINTS
+# -----------------------------------------------------------------------------
+
+def generate_news_id() -> str:
+    return f"news_{secrets.token_hex(6)}"
+
+class NewsCreate(BaseModel):
+    title: str
+    content: Optional[str] = None
+    image_url: Optional[str] = None
+    link: Optional[str] = None
+    has_ticket: bool = False
+    price: Optional[float] = None
+
+@app.get("/api/admin/news")
+async def get_all_news_admin(admin: dict = Depends(get_admin_user)):
+    news = await db.news.find().sort("created_at", -1).to_list(100)
+    return [{"news_id": n.get("news_id"), "title": n.get("title"), 
+             "link": n.get("link"), "has_ticket": n.get("has_ticket", False),
+             "price": n.get("price"), "created_at": n.get("created_at")} for n in news]
+
+@app.post("/api/admin/news")
+async def create_news(news: NewsCreate, admin: dict = Depends(get_admin_user)):
+    news_data = {
+        "news_id": generate_news_id(),
+        "title": news.title,
+        "content": news.content,
+        "image_url": news.image_url,
+        "link": news.link,
+        "has_ticket": news.has_ticket,
+        "price": news.price,
+        "created_at": datetime.utcnow()
+    }
+    await db.news.insert_one(news_data)
+    # Rimuovi _id per evitare errore JSON serialization
+    news_data.pop('_id', None)
+    return news_data
+
+@app.put("/api/admin/news/{news_id}")
+async def update_news(news_id: str, news: NewsCreate, admin: dict = Depends(get_admin_user)):
+    result = await db.news.update_one(
+        {"news_id": news_id},
+        {"$set": {
+            "title": news.title, 
+            "content": news.content,
+            "image_url": news.image_url,
+            "link": news.link, 
+            "has_ticket": news.has_ticket, 
+            "price": news.price
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="News non trovata")
+    return {"message": "News aggiornata"}
+
+@app.delete("/api/admin/news/{news_id}")
+async def delete_news(news_id: str, admin: dict = Depends(get_admin_user)):
+    result = await db.news.delete_one({"news_id": news_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="News non trovata")
+    return {"message": "News eliminata"}
+
+# -----------------------------------------------------------------------------
+# ADMIN MARKET ENDPOINTS
+# -----------------------------------------------------------------------------
+
+def generate_market_id() -> str:
+    return f"item_{secrets.token_hex(6)}"
+
+class MarketItemCreate(BaseModel):
+    title: str
+    description: str = ""
+    image_url: str = ""
+    link: str
+    category: str = "Altro"
+
+# Endpoint pubblico per il market
+@app.get("/api/market")
+async def get_market_items():
+    """Lista prodotti market per tutti gli utenti"""
+    items = await db.market.find().to_list(100)
+    return [{"item_id": i.get("item_id"), "title": i.get("title"), 
+             "description": i.get("description"),
+             "link": i.get("link"), "category": i.get("category")} for i in items]
+
+@app.get("/api/admin/market")
+async def get_all_market_admin(admin: dict = Depends(get_admin_user)):
+    items = await db.market.find().to_list(100)
+    return [{"item_id": i.get("item_id"), "title": i.get("title"), 
+             "description": i.get("description"), "image_url": i.get("image_url"),
+             "link": i.get("link"), "category": i.get("category")} for i in items]
+
+@app.post("/api/admin/market")
+async def create_market_item(item: MarketItemCreate, admin: dict = Depends(get_admin_user)):
+    item_data = {
+        "item_id": generate_market_id(),
+        "title": item.title,
+        "description": item.description,
+        "image_url": item.image_url,
+        "link": item.link,
+        "category": item.category,
+        "created_at": datetime.utcnow()
+    }
+    await db.market.insert_one(item_data)
+    # Rimuovi _id per evitare errore JSON serialization
+    item_data.pop('_id', None)
+    return item_data
+
+@app.put("/api/admin/market/{item_id}")
+async def update_market_item(item_id: str, item: MarketItemCreate, admin: dict = Depends(get_admin_user)):
+    result = await db.market.update_one(
+        {"item_id": item_id},
+        {"$set": {
+            "title": item.title,
+            "description": item.description,
+            "image_url": item.image_url,
+            "link": item.link,
+            "category": item.category
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Prodotto non trovato")
+    return {"message": "Prodotto aggiornato"}
+
+@app.delete("/api/admin/market/{item_id}")
+async def delete_market_item(item_id: str, admin: dict = Depends(get_admin_user)):
+    result = await db.market.delete_one({"item_id": item_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Prodotto non trovato")
+    return {"message": "Prodotto eliminato"}
+
+# -----------------------------------------------------------------------------
+# ADMIN SECTIONS ENDPOINTS
+# -----------------------------------------------------------------------------
+
+class AppSectionsUpdate(BaseModel):
+    sections: list
+
+@app.get("/api/admin/sections")
+async def get_app_sections(admin: dict = Depends(get_admin_user)):
+    config = await db.app_config.find_one({"config_id": "sections"})
+    if config:
+        return config.get("sections", [])
+    return []
+
+@app.put("/api/admin/sections")
+async def update_app_sections(data: AppSectionsUpdate, admin: dict = Depends(get_admin_user)):
+    await db.app_config.update_one(
+        {"config_id": "sections"},
+        {"$set": {"sections": data.sections, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+    return {"message": "Sezioni aggiornate"}
+
+# -----------------------------------------------------------------------------
+# ADMIN BLOG ENDPOINTS
+# -----------------------------------------------------------------------------
+
+def generate_post_id() -> str:
+    return f"post_{secrets.token_hex(6)}"
+
+class BlogPostCreate(BaseModel):
+    title: str
+    link: str
+
+@app.get("/api/admin/blog")
+async def get_all_blog_admin(admin: dict = Depends(get_admin_user)):
+    posts = await db.blog.find().sort("created_at", -1).to_list(100)
+    return [{"post_id": p.get("post_id"), "title": p.get("title"), 
+             "link": p.get("link"), "created_at": p.get("created_at")} for p in posts]
+
+@app.post("/api/admin/blog")
+async def create_blog_post(post: BlogPostCreate, admin: dict = Depends(get_admin_user)):
+    post_data = {
+        "post_id": generate_post_id(),
+        "title": post.title,
+        "link": post.link,
+        "created_at": datetime.utcnow()
+    }
+    await db.blog.insert_one(post_data)
+    # Rimuovi _id per evitare errore JSON serialization
+    post_data.pop('_id', None)
+    return post_data
+
+@app.put("/api/admin/blog/{post_id}")
+async def update_blog_post(post_id: str, post: BlogPostCreate, admin: dict = Depends(get_admin_user)):
+    result = await db.blog.update_one(
+        {"post_id": post_id},
+        {"$set": {"title": post.title, "link": post.link}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    return {"message": "Articolo aggiornato"}
+
+@app.delete("/api/admin/blog/{post_id}")
+async def delete_blog_post(post_id: str, admin: dict = Depends(get_admin_user)):
+    result = await db.blog.delete_one({"post_id": post_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    return {"message": "Articolo eliminato"}
 
 # =============================================================================
 # ADMIN WEB PANEL
@@ -902,7 +1508,42 @@ ADMIN_HTML = """
 
             <!-- Users Tab -->
             <div id="usersTab" class="card hidden">
-                <h2>👥 Utenti Registrati</h2>
+                <h2>👥 Gestione Utenti</h2>
+                
+                <!-- Crea nuovo utente -->
+                <div style="background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                    <h3 style="margin-bottom: 15px;">➕ Crea Nuovo Utente</h3>
+                    <input type="text" id="newUserName" placeholder="Nome">
+                    <input type="email" id="newUserEmail" placeholder="Email">
+                    <input type="password" id="newUserPassword" placeholder="Password">
+                    <label style="color: #ccc; display: flex; align-items: center; gap: 8px; margin: 10px 0;">
+                        <input type="checkbox" id="newUserAdmin"> Rendi Admin
+                    </label>
+                    <button class="btn" onclick="createUser()">Crea Utente</button>
+                    <div id="createUserResult"></div>
+                </div>
+                
+                <!-- Regala libro -->
+                <div style="background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                    <h3 style="margin-bottom: 15px;">🎁 Regala Libro</h3>
+                    <select id="giftUserSelect" style="width: 100%; padding: 12px; margin-bottom: 10px; background: #222; color: #fff; border: 1px solid #444; border-radius: 5px;">
+                        <option value="">Seleziona utente...</option>
+                    </select>
+                    <select id="giftProductSelect" style="width: 100%; padding: 12px; margin-bottom: 10px; background: #222; color: #fff; border: 1px solid #444; border-radius: 5px;">
+                        <option value="">Seleziona prodotto...</option>
+                        <option value="books_full_access">📚 Tutti i Libri (pacchetto completo)</option>
+                        <option value="book_lux">📖 LUX</option>
+                        <option value="book_imago">📖 IMAGO</option>
+                        <option value="book_omnia">📖 OMNIA</option>
+                        <option value="book_tabula">📖 TABULA</option>
+                        <option value="book_lux2">📖 LUX2</option>
+                    </select>
+                    <button class="btn" onclick="giftBook()">🎁 Regala</button>
+                    <div id="giftResult"></div>
+                </div>
+                
+                <!-- Lista utenti -->
+                <h3 style="margin-bottom: 15px;">📋 Utenti Registrati</h3>
                 <div id="usersList"></div>
             </div>
 
@@ -915,13 +1556,38 @@ ADMIN_HTML = """
                         <input type="text" id="bookTitle" placeholder="Titolo">
                         <input type="text" id="bookDesc" placeholder="Descrizione">
                         <input type="text" id="bookCover" placeholder="URL Cover">
-                        <input type="text" id="bookPdf" placeholder="URL PDF">
-                        <input type="number" id="bookPrice" placeholder="Prezzo" value="0">
+                        <input type="text" id="bookPdf" placeholder="URL PDF (Google Drive, Dropbox...)">
+                        <input type="text" id="bookProductId" placeholder="Product ID (es: book_lux)">
+                        <input type="number" id="bookOrder" placeholder="Ordine (1=primo, 2=secondo...)" value="1">
                         <button class="btn" onclick="addBook()">Aggiungi Libro</button>
                     </div>
                     <div>
-                        <h3 style="margin-bottom: 15px;">Libri Esistenti</h3>
+                        <h3 style="margin-bottom: 15px;">Libri Esistenti (clicca per modificare)</h3>
                         <div id="booksList"></div>
+                    </div>
+                </div>
+                
+                <!-- Modal Modifica Libro -->
+                <div id="editBookModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; padding: 20px; overflow-y: auto;">
+                    <div style="max-width: 500px; margin: 50px auto; background: #1a1a1a; padding: 30px; border-radius: 12px;">
+                        <h3 style="margin-bottom: 20px;">✏️ Modifica Libro</h3>
+                        <input type="hidden" id="editBookId">
+                        <label style="color: #888; font-size: 12px;">Titolo</label>
+                        <input type="text" id="editBookTitle" placeholder="Titolo">
+                        <label style="color: #888; font-size: 12px;">Descrizione</label>
+                        <input type="text" id="editBookDesc" placeholder="Descrizione">
+                        <label style="color: #888; font-size: 12px;">URL Cover</label>
+                        <input type="text" id="editBookCover" placeholder="URL Cover">
+                        <label style="color: #888; font-size: 12px;">URL PDF</label>
+                        <input type="text" id="editBookPdf" placeholder="URL PDF">
+                        <label style="color: #888; font-size: 12px;">Product ID (per IAP)</label>
+                        <input type="text" id="editBookProductId" placeholder="es: book_lux">
+                        <label style="color: #888; font-size: 12px;">Ordine</label>
+                        <input type="number" id="editBookOrder" placeholder="Ordine">
+                        <div style="display: flex; gap: 10px; margin-top: 20px;">
+                            <button class="btn" onclick="saveBookEdit()">💾 Salva</button>
+                            <button class="btn btn-secondary" onclick="closeEditModal()">Annulla</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1048,34 +1714,49 @@ ADMIN_HTML = """
                 <div class="stat"><div class="stat-value">${premiumUsers}</div><div class="stat-label">Premium</div></div>
             `;
             
-            // Users list
-            document.getElementById('usersList').innerHTML = users.map(u => `
+            // Users list with actions
+            let userSelectOptions = '<option value="">Seleziona utente...</option>';
+            document.getElementById('usersList').innerHTML = users.map(u => {
+                userSelectOptions += `<option value="${u.user_id}">${u.name} (${u.email})</option>`;
+                return `
                 <div class="user-item">
                     <div class="user-info">
                         <div class="user-name">${u.name} ${u.is_admin ? '<span class="badge badge-admin">Admin</span>' : ''} ${u.has_push_token ? '<span class="badge badge-push">Push</span>' : ''} ${u.plan === 'premium' ? '<span class="badge badge-premium">Premium</span>' : ''}</div>
                         <div class="user-email">${u.email}</div>
+                        <div style="font-size: 12px; color: #666; margin-top: 4px;">Acquisti: ${u.purchases ? u.purchases.join(', ') : 'nessuno'}</div>
                     </div>
-                    <div>${u.referral_code}</div>
+                    <div style="display: flex; gap: 5px; flex-wrap: wrap;">
+                        <button class="btn btn-secondary" onclick="toggleAdmin('${u.user_id}')" title="Toggle Admin">${u.is_admin ? '👤' : '👑'}</button>
+                        <button class="btn btn-secondary" onclick="applyReferral('${u.user_id}')" title="Applica Referral">🎁</button>
+                    </div>
                 </div>
-            `).join('');
+            `}).join('');
+            document.getElementById('giftUserSelect').innerHTML = userSelectOptions;
             
-            // Load books
+            // Load books - use admin endpoint for full details
             try {
-                const booksRes = await fetch(API_URL + '/api/books', {
+                const booksRes = await fetch(API_URL + '/api/admin/books', {
                     headers: { 'Authorization': 'Bearer ' + authToken }
                 });
                 const books = await booksRes.json();
+                window.booksData = books; // Store for edit modal
                 document.getElementById('booksList').innerHTML = books.length ? books.map(b => `
-                    <div class="user-item">
+                    <div class="user-item" style="cursor: pointer;" onclick='openEditModal(${JSON.stringify(b).replace(/'/g, "\\'")})'>
                         <div class="user-info">
-                            <div class="user-name">${b.title}</div>
+                            <div class="user-name">${b.sort_order || '?'}. ${b.title}</div>
                             <div class="user-email">${b.description || ''}</div>
+                            <div style="font-size: 11px; color: #666; margin-top: 4px;">
+                                ID: ${b.product_id || 'N/A'} | 
+                                PDF: ${b.pdf_url ? '✅' : '❌ MANCA'}
+                            </div>
                         </div>
-                        <button class="btn btn-secondary" onclick="deleteBook('${b.book_id}')">🗑️</button>
+                        <div style="display: flex; gap: 5px;">
+                            <button class="btn btn-secondary" onclick="event.stopPropagation(); deleteBook('${b.book_id}')">🗑️</button>
+                        </div>
                     </div>
                 `).join('') : '<p style="color:#888">Nessun libro</p>';
             } catch (e) {
-                console.log('Error loading books');
+                console.log('Error loading books:', e);
             }
 
             // Load tutorials
@@ -1130,11 +1811,12 @@ ADMIN_HTML = """
                 description: document.getElementById('bookDesc').value,
                 cover_url: document.getElementById('bookCover').value,
                 pdf_url: document.getElementById('bookPdf').value,
-                price: parseFloat(document.getElementById('bookPrice').value) || 0
+                product_id: document.getElementById('bookProductId').value || 'book_single',
+                sort_order: parseInt(document.getElementById('bookOrder').value) || 1
             };
             
             if (!book.title || !book.cover_url || !book.pdf_url) {
-                alert('Compila tutti i campi obbligatori');
+                alert('Compila tutti i campi obbligatori (Titolo, Cover, PDF)');
                 return;
             }
             
@@ -1152,7 +1834,8 @@ ADMIN_HTML = """
             document.getElementById('bookDesc').value = '';
             document.getElementById('bookCover').value = '';
             document.getElementById('bookPdf').value = '';
-            document.getElementById('bookPrice').value = '0';
+            document.getElementById('bookProductId').value = '';
+            document.getElementById('bookOrder').value = '1';
             loadData();
         }
 
@@ -1164,6 +1847,55 @@ ADMIN_HTML = """
                 headers: { 'Authorization': 'Bearer ' + authToken }
             });
             loadData();
+        }
+
+        function openEditModal(book) {
+            document.getElementById('editBookId').value = book.book_id;
+            document.getElementById('editBookTitle').value = book.title || '';
+            document.getElementById('editBookDesc').value = book.description || '';
+            document.getElementById('editBookCover').value = book.cover_url || '';
+            document.getElementById('editBookPdf').value = book.pdf_url || '';
+            document.getElementById('editBookProductId').value = book.product_id || '';
+            document.getElementById('editBookOrder').value = book.sort_order || 1;
+            document.getElementById('editBookModal').style.display = 'block';
+        }
+
+        function closeEditModal() {
+            document.getElementById('editBookModal').style.display = 'none';
+        }
+
+        async function saveBookEdit() {
+            const bookId = document.getElementById('editBookId').value;
+            const book = {
+                title: document.getElementById('editBookTitle').value,
+                description: document.getElementById('editBookDesc').value,
+                cover_url: document.getElementById('editBookCover').value,
+                pdf_url: document.getElementById('editBookPdf').value,
+                product_id: document.getElementById('editBookProductId').value,
+                sort_order: parseInt(document.getElementById('editBookOrder').value) || 1
+            };
+            
+            try {
+                const res = await fetch(API_URL + '/api/admin/books/' + bookId, {
+                    method: 'PUT',
+                    headers: { 
+                        'Authorization': 'Bearer ' + authToken,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(book)
+                });
+                
+                if (res.ok) {
+                    alert('Libro aggiornato!');
+                    closeEditModal();
+                    loadData();
+                } else {
+                    const data = await res.json();
+                    alert('Errore: ' + (data.detail || 'Errore sconosciuto'));
+                }
+            } catch (e) {
+                alert('Errore di connessione');
+            }
         }
 
         async function addTutorial() {
@@ -1207,6 +1939,116 @@ ADMIN_HTML = """
             });
             loadData();
         }
+
+        async function createUser() {
+            const name = document.getElementById('newUserName').value;
+            const email = document.getElementById('newUserEmail').value;
+            const password = document.getElementById('newUserPassword').value;
+            const isAdmin = document.getElementById('newUserAdmin').checked;
+            
+            if (!name || !email || !password) {
+                alert('Compila tutti i campi');
+                return;
+            }
+            
+            try {
+                const res = await fetch(API_URL + '/api/admin/create-user', {
+                    method: 'POST',
+                    headers: { 
+                        'Authorization': 'Bearer ' + authToken,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ name, email, password, is_admin: isAdmin })
+                });
+                const data = await res.json();
+                
+                if (res.ok) {
+                    document.getElementById('createUserResult').innerHTML = `
+                        <div class="alert alert-success">Utente creato: ${email}</div>
+                    `;
+                    document.getElementById('newUserName').value = '';
+                    document.getElementById('newUserEmail').value = '';
+                    document.getElementById('newUserPassword').value = '';
+                    document.getElementById('newUserAdmin').checked = false;
+                    loadData();
+                } else {
+                    document.getElementById('createUserResult').innerHTML = `
+                        <div class="alert alert-error">${data.detail || 'Errore'}</div>
+                    `;
+                }
+            } catch (e) {
+                document.getElementById('createUserResult').innerHTML = `
+                    <div class="alert alert-error">Errore di connessione</div>
+                `;
+            }
+        }
+
+        async function giftBook() {
+            const userId = document.getElementById('giftUserSelect').value;
+            const productId = document.getElementById('giftProductSelect').value;
+            
+            if (!userId || !productId) {
+                alert('Seleziona utente e prodotto');
+                return;
+            }
+            
+            try {
+                const res = await fetch(API_URL + '/api/admin/gift-book', {
+                    method: 'POST',
+                    headers: { 
+                        'Authorization': 'Bearer ' + authToken,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ user_id: userId, product_id: productId })
+                });
+                const data = await res.json();
+                
+                if (res.ok) {
+                    document.getElementById('giftResult').innerHTML = `
+                        <div class="alert alert-success">🎁 ${data.message}</div>
+                    `;
+                    loadData();
+                } else {
+                    document.getElementById('giftResult').innerHTML = `
+                        <div class="alert alert-error">${data.detail || 'Errore'}</div>
+                    `;
+                }
+            } catch (e) {
+                document.getElementById('giftResult').innerHTML = `
+                    <div class="alert alert-error">Errore di connessione</div>
+                `;
+            }
+        }
+
+        async function toggleAdmin(userId) {
+            if (!confirm('Sei sicuro di voler cambiare lo stato admin di questo utente?')) return;
+            
+            try {
+                const res = await fetch(API_URL + '/api/admin/toggle-admin/' + userId, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + authToken }
+                });
+                const data = await res.json();
+                alert(data.message);
+                loadData();
+            } catch (e) {
+                alert('Errore');
+            }
+        }
+
+        async function applyReferral(userId) {
+            try {
+                const res = await fetch(API_URL + '/api/admin/apply-referral/' + userId, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + authToken }
+                });
+                const data = await res.json();
+                alert(data.message);
+                loadData();
+            } catch (e) {
+                alert('Errore');
+            }
+        }
     </script>
 </body>
 </html>
@@ -1226,6 +2068,371 @@ async def root():
         <body><a href="/admin">Vai al pannello admin</a></body>
     </html>
     """
+
+# =============================================================================
+# AI TOOLS - Generatore Idee e Moodboard
+# =============================================================================
+
+class AIRequest(BaseModel):
+    prompt: str
+    tool_type: str  # "ideas" o "moodboard"
+
+class AIResponse(BaseModel):
+    content: str
+    remaining_today: int
+
+# Limite giornaliero per utenti normali
+AI_DAILY_LIMIT = 2  # Per idee e moodboard
+AI_LIGHTING_DAILY_LIMIT = 2  # Per analisi foto
+
+async def check_ai_limit(user_id: str, is_admin: bool, tool_type: str = "general") -> int:
+    """Controlla e restituisce le richieste rimanenti"""
+    if is_admin:
+        return 999  # Admin illimitato
+    
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    
+    # Usa limiti diversi per lighting
+    if tool_type == "lighting":
+        usage = await db.ai_lighting_usage.find_one({"user_id": user_id, "date": today})
+        limit = AI_LIGHTING_DAILY_LIMIT
+    else:
+        usage = await db.ai_usage.find_one({"user_id": user_id, "date": today})
+        limit = AI_DAILY_LIMIT
+    
+    if not usage:
+        return limit
+    
+    return max(0, limit - usage.get("count", 0))
+
+async def increment_ai_usage(user_id: str, tool_type: str = "general"):
+    """Incrementa il contatore di utilizzo AI"""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    
+    if tool_type == "lighting":
+        collection = db.ai_lighting_usage
+    else:
+        collection = db.ai_usage
+    
+    await collection.update_one(
+        {"user_id": user_id, "date": today},
+        {"$inc": {"count": 1}},
+        upsert=True
+    )
+
+@app.get("/api/ai/remaining")
+async def get_ai_remaining(user: dict = Depends(get_current_user)):
+    """Restituisce le richieste AI rimanenti per oggi"""
+    is_admin = user.get("email", "").lower() == ADMIN_EMAIL.lower()
+    remaining = await check_ai_limit(user["user_id"], is_admin, "general")
+    remaining_lighting = await check_ai_limit(user["user_id"], is_admin, "lighting")
+    return {
+        "remaining": remaining, 
+        "limit": AI_DAILY_LIMIT if not is_admin else "unlimited",
+        "remaining_lighting": remaining_lighting,
+        "limit_lighting": AI_LIGHTING_DAILY_LIMIT if not is_admin else "unlimited"
+    }
+
+@app.post("/api/ai/generate")
+async def generate_ai_content(request: AIRequest, user: dict = Depends(get_current_user)):
+    """Genera contenuto AI (idee shooting o moodboard)"""
+    is_admin = user.get("email", "").lower() == ADMIN_EMAIL.lower()
+    remaining = await check_ai_limit(user["user_id"], is_admin)
+    
+    if remaining <= 0 and not is_admin:
+        raise HTTPException(
+            status_code=429, 
+            detail="Hai raggiunto il limite giornaliero di 5 richieste AI. Torna domani!"
+        )
+    
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(status_code=500, detail="AI non configurata")
+    
+    try:
+        # Configura il prompt in base al tipo di tool
+        if request.tool_type == "ideas":
+            system_message = """Sei un consulente creativo per fotografi professionisti. 
+            Genera 5 idee creative e dettagliate per uno shooting fotografico basato sul tema richiesto.
+            Per ogni idea includi:
+            - Titolo dell'idea
+            - Location consigliata
+            - Orario migliore (golden hour, blue hour, ecc.)
+            - Setup luci suggerito
+            - Mood/atmosfera
+            - Props o elementi da includere
+            Rispondi in italiano in modo professionale ma accessibile."""
+        else:  # moodboard
+            system_message = """Sei un art director specializzato in fotografia.
+            Crea una moodboard testuale dettagliata per il tipo di shooting richiesto.
+            Includi:
+            - Palette colori (descrivi 4-5 colori con i loro codici hex)
+            - Atmosfera generale
+            - Stile fotografico di riferimento
+            - Abbigliamento/styling suggerito
+            - Props e accessori
+            - Riferimenti artistici/fotografici
+            - Musica di sottofondo suggerita per il set
+            Rispondi in italiano in modo professionale e ispirazionale."""
+        
+        # Crea la chat AI con OpenAI direttamente
+        client = OpenAI(api_key=EMERGENT_LLM_KEY)
+        
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": request.prompt}
+            ]
+        )
+        response = completion.choices[0].message.content
+        
+        # Incrementa il contatore (solo per non-admin)
+        if not is_admin:
+            await increment_ai_usage(user["user_id"])
+        
+        new_remaining = await check_ai_limit(user["user_id"], is_admin)
+        
+        return {
+            "content": response,
+            "remaining_today": new_remaining
+        }
+        
+    except Exception as e:
+        logger.error(f"AI generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore nella generazione: {str(e)}")
+
+class AILightingRequest(BaseModel):
+    image_base64: str  # Immagine in base64
+
+@app.post("/api/ai/analyze-lighting")
+async def analyze_lighting(request: AILightingRequest, user: dict = Depends(get_current_user)):
+    """Analizza l'illuminazione di una foto portrait"""
+    is_admin = user.get("email", "").lower() == ADMIN_EMAIL.lower()
+    remaining = await check_ai_limit(user["user_id"], is_admin, "lighting")
+    
+    if remaining <= 0 and not is_admin:
+        raise HTTPException(
+            status_code=429, 
+            detail="Hai raggiunto il limite giornaliero di 2 analisi. Torna domani!"
+        )
+    
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(status_code=500, detail="AI non configurata")
+    
+    try:
+        system_message = """Sei un esperto di illuminazione fotografica professionale.
+Analizza l'immagine e determina PRIMA DI TUTTO se si tratta di un ritratto fotografico realizzato con luce controllata (studio, flash, softbox, ecc.).
+
+SE NON è un ritratto con luce controllata (es. paesaggio, tramonto, monumento, foto di strada, selfie con luce naturale, foto di oggetti, ecc.), rispondi ESATTAMENTE con:
+"La foto caricata non è un portrait realizzato con luce controllata."
+
+SE È un ritratto con luce controllata, fornisci un'analisi dettagliata includendo:
+
+1. **Schema di illuminazione**: (Rembrandt, Butterfly, Loop, Split, Broad, Short, ecc.)
+2. **Luce principale (Key Light)**:
+   - Posizione (es. 45° a sinistra, dall'alto)
+   - Tipo probabile (softbox, beauty dish, ombrello, luce naturale modificata)
+   - Qualità (dura/morbida)
+3. **Luce di riempimento (Fill Light)**: se presente, posizione e intensità
+4. **Luce di contorno (Rim/Hair Light)**: se presente
+5. **Sfondo**: come è illuminato
+6. **Rapporto di illuminazione stimato**: (es. 2:1, 3:1, 4:1)
+7. **Suggerimenti per ricrearlo**: equipaggiamento necessario e setup
+
+Rispondi in italiano in modo tecnico ma comprensibile."""
+
+        # Crea la chat AI con OpenAI direttamente (con supporto immagini)
+        client = OpenAI(api_key=EMERGENT_LLM_KEY)
+        
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_message},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analizza l'illuminazione di questa foto."},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{request.image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+        response = completion.choices[0].message.content
+        
+        # Incrementa il contatore (solo per non-admin)
+        if not is_admin:
+            await increment_ai_usage(user["user_id"], "lighting")
+        
+        new_remaining = await check_ai_limit(user["user_id"], is_admin, "lighting")
+        
+        return {
+            "content": response,
+            "remaining_today": new_remaining
+        }
+        
+    except Exception as e:
+        logger.error(f"AI lighting analysis error: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore nell'analisi: {str(e)}")
+
+# =============================================================================
+# HOME BADGES
+# =============================================================================
+
+@app.get("/api/home-badges")
+async def get_home_badges():
+    """Get active home badges (public endpoint)"""
+    try:
+        badges = []
+        for badge_id in [1, 2]:
+            badge = await db.home_badges.find_one({"badge_id": badge_id})
+            if badge:
+                # Check if badge should auto-expire
+                if badge.get("active") and badge.get("auto_expire_24h") and badge.get("activated_at"):
+                    activated_at = badge["activated_at"]
+                    if datetime.utcnow() - activated_at > timedelta(hours=24):
+                        # Auto-deactivate
+                        await db.home_badges.update_one(
+                            {"badge_id": badge_id},
+                            {"$set": {"active": False}}
+                        )
+                        badge["active"] = False
+                
+                if badge.get("active"):
+                    badges.append({
+                        "badge_id": badge["badge_id"],
+                        "text": badge.get("text", ""),
+                        "link": badge.get("link", ""),
+                    })
+        
+        return {"badges": badges}
+    except Exception as e:
+        logger.error(f"Error getting home badges: {e}")
+        return {"badges": []}
+
+@app.get("/api/admin/home-badges")
+async def get_admin_home_badges(current_user: dict = Depends(get_current_user)):
+    """Get all home badges for admin (with full details)"""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Solo admin può gestire i badge")
+    
+    try:
+        badges = []
+        for badge_id in [1, 2]:
+            badge = await db.home_badges.find_one({"badge_id": badge_id})
+            if not badge:
+                # Create default badge
+                badge = {
+                    "badge_id": badge_id,
+                    "active": False,
+                    "text": "",
+                    "link": "",
+                    "auto_expire_24h": False,
+                    "activated_at": None,
+                    "updated_at": datetime.utcnow()
+                }
+                await db.home_badges.insert_one(badge)
+            
+            # Check auto-expire status
+            expired = False
+            if badge.get("active") and badge.get("auto_expire_24h") and badge.get("activated_at"):
+                if datetime.utcnow() - badge["activated_at"] > timedelta(hours=24):
+                    await db.home_badges.update_one(
+                        {"badge_id": badge_id},
+                        {"$set": {"active": False}}
+                    )
+                    badge["active"] = False
+                    expired = True
+            
+            badges.append({
+                "badge_id": badge["badge_id"],
+                "active": badge.get("active", False),
+                "text": badge.get("text", ""),
+                "link": badge.get("link", ""),
+                "auto_expire_24h": badge.get("auto_expire_24h", False),
+                "activated_at": badge.get("activated_at").isoformat() if badge.get("activated_at") else None,
+                "updated_at": badge.get("updated_at").isoformat() if badge.get("updated_at") else None,
+                "expired": expired,
+            })
+        
+        return {"badges": badges}
+    except Exception as e:
+        logger.error(f"Error getting admin home badges: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/home-badges/{badge_id}")
+async def update_home_badge(
+    badge_id: int,
+    badge_data: HomeBadgeUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update a home badge (admin only)"""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Solo admin può gestire i badge")
+    
+    if badge_id not in [1, 2]:
+        raise HTTPException(status_code=400, detail="Badge ID deve essere 1 o 2")
+    
+    try:
+        # Get current badge to check if we're activating it
+        current_badge = await db.home_badges.find_one({"badge_id": badge_id})
+        was_active = current_badge.get("active", False) if current_badge else False
+        
+        update_data = {
+            "badge_id": badge_id,
+            "active": badge_data.active,
+            "text": badge_data.text,
+            "link": badge_data.link,
+            "auto_expire_24h": badge_data.auto_expire_24h,
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Set activated_at timestamp when badge is activated
+        if badge_data.active and not was_active:
+            update_data["activated_at"] = datetime.utcnow()
+        elif not badge_data.active:
+            update_data["activated_at"] = None
+        
+        await db.home_badges.update_one(
+            {"badge_id": badge_id},
+            {"$set": update_data},
+            upsert=True
+        )
+        
+        return {
+            "success": True,
+            "message": f"Badge {badge_id} aggiornato",
+            "badge": {
+                "badge_id": badge_id,
+                "active": badge_data.active,
+                "text": badge_data.text,
+                "link": badge_data.link,
+                "auto_expire_24h": badge_data.auto_expire_24h,
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error updating home badge: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =============================================================================
+# PROJECT DOWNLOAD
+# =============================================================================
+
+@app.get("/api/download-project")
+async def download_project():
+    """Download the complete project as ZIP"""
+    zip_path = Path(__file__).parent / "lumina-ingegno-project.zip"
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="Project ZIP not found")
+    return FileResponse(
+        path=str(zip_path),
+        filename="lumina-ingegno-project.zip",
+        media_type="application/zip"
+    )
 
 # =============================================================================
 # STARTUP
