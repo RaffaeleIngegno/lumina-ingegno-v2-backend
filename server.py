@@ -30,8 +30,19 @@ from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, messaging
 
+# Google Auth per conversione token APNs -> FCM
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
+
 # OpenAI Integration
 from openai import OpenAI
+
+# PDF to Image conversion
+import pymupdf
+import io
+import base64
+import tempfile
+from fastapi.responses import Response
 
 # Load environment variables
 load_dotenv()
@@ -48,6 +59,11 @@ ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "raffaeleingegno.com@gmail.com")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMERGENT_LLM_KEY = os.getenv("EMERGENT_LLM_KEY")
 
+# Uploads directory - usa path relativo per compatibilità Railway
+BASE_DIR = Path(__file__).resolve().parent
+UPLOADS_DIR = BASE_DIR / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
 # JWT Config
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
@@ -62,16 +78,85 @@ if RESEND_API_KEY:
 # Initialize Firebase Admin SDK
 FIREBASE_CREDS_PATH = Path(__file__).parent / "firebase-credentials.json"
 firebase_initialized = False
+firebase_credentials_dict = None
+
 if FIREBASE_CREDS_PATH.exists():
     try:
         cred = credentials.Certificate(str(FIREBASE_CREDS_PATH))
         firebase_admin.initialize_app(cred)
         firebase_initialized = True
         logger.info("Firebase Admin SDK initialized successfully")
+        
+        # Carica le credenziali per la conversione APNs -> FCM
+        import json
+        with open(FIREBASE_CREDS_PATH) as f:
+            firebase_credentials_dict = json.load(f)
     except Exception as e:
         logger.error(f"Failed to initialize Firebase: {e}")
 else:
     logger.warning(f"Firebase credentials not found at {FIREBASE_CREDS_PATH}")
+
+# Configurazione per la conversione APNs token -> FCM token
+IOS_BUNDLE_ID = "com.ringegno.luminaingegno"
+# APNS_SANDBOX: "true" per TestFlight, "false" per App Store production
+# Configurabile via variabile d'ambiente su Railway
+APNS_SANDBOX = os.getenv("APNS_SANDBOX", "true").lower() == "true"
+
+async def convert_apns_to_fcm(apns_token: str) -> str | None:
+    """
+    Converte un token APNs (iOS) in un token FCM registration.
+    Usa l'API Instance ID di Firebase con autenticazione OAuth2.
+    """
+    if not firebase_credentials_dict:
+        logger.error("Firebase credentials not available for APNs conversion")
+        return None
+    
+    try:
+        import requests
+        
+        # Crea credenziali OAuth2 dal service account
+        scopes = ['https://www.googleapis.com/auth/firebase.messaging']
+        credentials_sa = service_account.Credentials.from_service_account_info(
+            firebase_credentials_dict,
+            scopes=scopes
+        )
+        
+        # Ottieni il token OAuth2
+        credentials_sa.refresh(GoogleAuthRequest())
+        access_token = credentials_sa.token
+        
+        # Chiama l'API Instance ID per importare il token APNs
+        url = "https://iid.googleapis.com/iid/v1:batchImport"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "access_token_auth": "true"
+        }
+        payload = {
+            "application": IOS_BUNDLE_ID,
+            "sandbox": APNS_SANDBOX,
+            "apns_tokens": [apns_token]
+        }
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("results", [])
+            if results and results[0].get("registration_token"):
+                fcm_token = results[0]["registration_token"]
+                logger.info(f"Successfully converted APNs token to FCM token")
+                return fcm_token
+            elif results and results[0].get("status"):
+                logger.warning(f"APNs conversion failed: {results[0].get('status')}")
+                return None
+        else:
+            logger.error(f"APNs conversion API error: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error converting APNs to FCM: {e}")
+        return None
 
 # MongoDB connection
 client = AsyncIOMotorClient(MONGO_URL)
@@ -79,6 +164,9 @@ db = client[DB_NAME]
 
 # FastAPI app
 app = FastAPI(title="Lumina Ingegno V2 API")
+
+# Monta la cartella uploads per servire file statici (banner, ecc.)
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
 # CORS
 app.add_middleware(
@@ -155,6 +243,20 @@ class HomeBadgeUpdate(BaseModel):
     text: str = ""
     link: str = ""
     auto_expire_24h: bool = False
+
+class HomeBannerCreate(BaseModel):
+    image_base64: str  # Immagine in base64
+    link_type: str = "none"  # none, internal, external
+    link_url: str = ""  # URL interno o esterno
+    order: int = 0  # Ordine nel carousel
+    active: bool = True
+
+class HomeBannerUpdate(BaseModel):
+    image_base64: Optional[str] = None
+    link_type: Optional[str] = None
+    link_url: Optional[str] = None
+    order: Optional[int] = None
+    active: Optional[bool] = None
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -235,7 +337,8 @@ async def send_verification_email(email: str, code: str, name: str):
         return
     
     try:
-        resend.Emails.send({
+        logger.info(f"Attempting to send verification email to {email}")
+        result = resend.Emails.send({
             "from": "Lumina Ingegno <noreply@raffaeleingegno.com>",
             "to": [email],
             "subject": "Codice di verifica - Lumina Ingegno",
@@ -249,9 +352,9 @@ async def send_verification_email(email: str, code: str, name: str):
             </div>
             """
         })
-        logger.info(f"Verification email sent to {email}")
+        logger.info(f"Verification email sent to {email}, result: {result}")
     except Exception as e:
-        logger.error(f"Error sending email: {e}")
+        logger.error(f"Error sending email to {email}: {str(e)}")
 
 # =============================================================================
 # PUSH NOTIFICATIONS (Firebase Cloud Messaging)
@@ -277,6 +380,22 @@ async def send_fcm_push(token: str, title: str, body: str, data: dict = None) ->
                     icon="notification_icon",
                     color="#cc3333",
                     sound="default",
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                headers={
+                    "apns-priority": "10",
+                    "apns-push-type": "alert",
+                },
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        alert=messaging.ApsAlert(
+                            title=title,
+                            body=body,
+                        ),
+                        sound="default",
+                        badge=1,
+                    ),
                 ),
             ),
         )
@@ -439,24 +558,6 @@ async def verify_registration(data: VerifyCode):
     token = create_access_token({"sub": user_id})
     logger.info(f"User registered: {data.email}")
     
-    # Invia email notifica admin per nuova iscrizione
-    try:
-        resend.api_key = os.getenv("RESEND_API_KEY")
-        resend.Emails.send({
-            "from": "Lumina Ingegno <noreply@raffaeleingegno.com>",
-            "to": ["info@raffaeleingegno.com"],
-            "subject": f"Nuova Iscrizione: {data.name}",
-            "html": f"""
-            <h2>Nuovo utente registrato!</h2>
-            <p><strong>Nome:</strong> {data.name}</p>
-            <p><strong>Email:</strong> {data.email}</p>
-            <p><strong>Data:</strong> {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}</p>
-            <p><strong>Referral Code:</strong> {referral_code}</p>
-            """
-        })
-    except Exception as e:
-        logger.error(f"Error sending registration notification email: {e}")
-    
     return TokenResponse(access_token=token, user=user_to_response(user))
 
 @app.post("/api/auth/login", response_model=TokenResponse)
@@ -517,8 +618,8 @@ async def forgot_password(data: ForgotPasswordRequest):
     # Invia email con codice
     try:
         if RESEND_API_KEY:
-            resend.Emails.send({
-                "from": "Lumina Ingegno <noreply@updates.raffaeleingegno.com>",
+            result = resend.Emails.send({
+                "from": "Lumina Ingegno <noreply@raffaeleingegno.com>",
                 "to": data.email,
                 "subject": "Recupero Password - Lumina Ingegno",
                 "html": f"""
@@ -536,7 +637,9 @@ async def forgot_password(data: ForgotPasswordRequest):
                 </div>
                 """
             })
-            logger.info(f"Password reset email sent to {data.email}")
+            logger.info(f"Password reset email sent to {data.email}, response: {result}")
+    except Exception as e:
+        logger.error(f"Error sending reset email: {e}")
     except Exception as e:
         logger.error(f"Error sending reset email: {e}")
     
@@ -640,12 +743,31 @@ async def register_push_token(
     data: PushTokenRequest,
     current_user: dict = Depends(get_current_user)
 ):
+    token_to_save = data.token
+    platform = data.platform
+    original_token = data.token  # Salva anche il token originale per debug
+    
+    # Se è iOS, converti il token APNs in token FCM
+    if platform == "ios":
+        logger.info(f"iOS token received, converting APNs to FCM for {current_user['email']}...")
+        fcm_token = await convert_apns_to_fcm(data.token)
+        if fcm_token:
+            token_to_save = fcm_token
+            logger.info(f"Successfully converted APNs to FCM for {current_user['email']}")
+        else:
+            logger.warning(f"Failed to convert APNs token for {current_user['email']}, using original token")
+            # Salviamo comunque il token originale, potrebbe essere già un FCM token
+    
     await db.users.update_one(
         {"user_id": current_user["user_id"]},
-        {"$set": {"push_token": data.token, "push_platform": data.platform}}
+        {"$set": {
+            "push_token": token_to_save,
+            "push_token_original": original_token,  # Per debug
+            "push_platform": platform
+        }}
     )
-    logger.info(f"Push token registered for {current_user['email']}")
-    return {"message": "Token registrato"}
+    logger.info(f"Push token registered for {current_user['email']} (platform: {platform})")
+    return {"message": "Token registrato", "platform": platform, "converted": platform == "ios" and token_to_save != original_token}
 
 # -----------------------------------------------------------------------------
 # BOOKS ENDPOINTS
@@ -711,6 +833,107 @@ async def get_book(book_id: str, current_user: dict = Depends(get_current_user))
 @app.get("/api/books/{book_id}/pdf")
 async def get_book_pdf(book_id: str, current_user: dict = Depends(get_current_user)):
     """Ottieni URL del PDF per un libro acquistato"""
+    # Trova il libro
+    book = await db.books.find_one({"book_id": book_id})
+    if not book:
+        raise HTTPException(status_code=404, detail="Libro non trovato")
+    
+    # Verifica accesso: admin sempre, oppure controlla purchases dell'utente
+    user_purchases = current_user.get("purchases", [])
+    has_full_access = "books_full_access" in user_purchases
+    is_admin = current_user.get("is_admin", False)
+    product_id = book.get("product_id", "")
+    
+    has_access = is_admin or has_full_access or book_id in user_purchases or product_id in user_purchases
+    
+    if not has_access:
+        raise HTTPException(status_code=403, detail="Libro non acquistato")
+    
+    pdf_url = book.get("pdf_url")
+    if not pdf_url:
+        raise HTTPException(status_code=404, detail="PDF non disponibile")
+    
+    return {"pdf_url": pdf_url, "title": book.get("title", "Libro")}
+
+
+# Endpoint per inizializzare/aggiornare i libri con i link PDF corretti (solo admin)
+@app.post("/api/admin/init-books")
+async def init_books(current_user: dict = Depends(get_current_user)):
+    """Inizializza o aggiorna i libri con i link PDF corretti - SOLO ADMIN"""
+    if not current_user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Solo admin")
+    
+    books_data = [
+        {
+            "book_id": "lux",
+            "title": "LUX",
+            "description": "Il primo libro della serie Lumina",
+            "cover_url": "https://i.imgur.com/placeholder_lux.jpg",
+            "pdf_url": "https://drive.google.com/file/d/14-U0-kdh7-Xir-RX-x8mO2lVbjMU6m6j/view?usp=drive_link",
+            "product_id": "book_lux",
+            "price": 9.99,
+            "sort_order": 1,
+        },
+        {
+            "book_id": "imago",
+            "title": "IMAGO",
+            "description": "Il secondo libro della serie Lumina",
+            "cover_url": "https://i.imgur.com/placeholder_imago.jpg",
+            "pdf_url": "https://drive.google.com/file/d/1HlVbNCEVs4eHoSql8w2tVQHZb9_efuyC/view?usp=drive_link",
+            "product_id": "book_imago",
+            "price": 9.99,
+            "sort_order": 2,
+        },
+        {
+            "book_id": "omnia",
+            "title": "OMNIA",
+            "description": "Il terzo libro della serie Lumina",
+            "cover_url": "https://i.imgur.com/placeholder_omnia.jpg",
+            "pdf_url": "https://drive.google.com/file/d/13INl4_nWvTqG386QVZMEhKBWB7Qjdm58/view?usp=drive_link",
+            "product_id": "book_omnia",
+            "price": 9.99,
+            "sort_order": 3,
+        },
+        {
+            "book_id": "tabula",
+            "title": "TABULA",
+            "description": "Il quarto libro della serie Lumina",
+            "cover_url": "https://i.imgur.com/placeholder_tabula.jpg",
+            "pdf_url": "https://drive.google.com/file/d/11fc3yD4bx2Hq5JZ--rutMMF8t4wHCmdO/view?usp=drive_link",
+            "product_id": "book_tabula",
+            "price": 9.99,
+            "sort_order": 4,
+        },
+        {
+            "book_id": "lux2",
+            "title": "LUX2",
+            "description": "Il quinto libro della serie Lumina",
+            "cover_url": "https://i.imgur.com/placeholder_lux2.jpg",
+            "pdf_url": "https://drive.google.com/file/d/1OmriITXScZwUAH1BY4ZYxYdTBEMefCZh/view?usp=drive_link",
+            "product_id": "book_lux2",
+            "price": 9.99,
+            "sort_order": 5,
+        },
+    ]
+    
+    updated = 0
+    created = 0
+    
+    for book in books_data:
+        existing = await db.books.find_one({"book_id": book["book_id"]})
+        if existing:
+            # Aggiorna solo il pdf_url, mantieni gli altri dati esistenti
+            await db.books.update_one(
+                {"book_id": book["book_id"]},
+                {"$set": {"pdf_url": book["pdf_url"]}}
+            )
+            updated += 1
+        else:
+            # Crea nuovo libro
+            await db.books.insert_one(book)
+            created += 1
+    
+    return {"message": f"Libri aggiornati: {updated}, creati: {created}"}
     book = await db.books.find_one({"book_id": book_id})
     if not book:
         raise HTTPException(status_code=404, detail="Libro non trovato")
@@ -731,6 +954,160 @@ async def get_book_pdf(book_id: str, current_user: dict = Depends(get_current_us
         raise HTTPException(status_code=404, detail="PDF non disponibile")
     
     return {"pdf_url": pdf_url, "title": book.get("title")}
+
+
+# Cache per i PDF scaricati (evita download ripetuti)
+_pdf_cache = {}
+
+async def download_pdf_from_drive(pdf_url: str) -> bytes:
+    """Scarica il PDF da Google Drive e lo restituisce come bytes"""
+    # Estrai file ID da URL Google Drive
+    file_id = None
+    if '/d/' in pdf_url:
+        file_id = pdf_url.split('/d/')[1].split('/')[0]
+    elif 'id=' in pdf_url:
+        file_id = pdf_url.split('id=')[1].split('&')[0]
+    
+    if not file_id:
+        raise HTTPException(status_code=400, detail="URL PDF non valido")
+    
+    # Controlla cache
+    if file_id in _pdf_cache:
+        cache_time, pdf_data = _pdf_cache[file_id]
+        # Cache valida per 1 ora
+        if datetime.now() - cache_time < timedelta(hours=1):
+            return pdf_data
+    
+    # Download diretto da Google Drive
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        response = await client.get(download_url)
+        
+        # Google Drive può richiedere conferma per file grandi
+        if b'confirm=' in response.content or b'download_warning' in response.text.encode():
+            # Cerca il token di conferma
+            import re
+            confirm_match = re.search(r'confirm=([^&]+)', response.text)
+            if confirm_match:
+                confirm_token = confirm_match.group(1)
+                download_url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
+                response = await client.get(download_url)
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Impossibile scaricare il PDF")
+        
+        pdf_data = response.content
+        
+        # Verifica che sia un PDF valido
+        if not pdf_data.startswith(b'%PDF'):
+            raise HTTPException(status_code=500, detail="Il file scaricato non è un PDF valido")
+        
+        # Salva in cache
+        _pdf_cache[file_id] = (datetime.now(), pdf_data)
+        
+        return pdf_data
+
+
+@app.get("/api/books/{book_id}/info")
+async def get_book_info(book_id: str, current_user: dict = Depends(get_current_user)):
+    """Ottieni informazioni sul libro incluso numero di pagine"""
+    book = await db.books.find_one({"book_id": book_id})
+    if not book:
+        raise HTTPException(status_code=404, detail="Libro non trovato")
+    
+    user_purchases = current_user.get("purchases", [])
+    has_full_access = "books_full_access" in user_purchases
+    is_admin = current_user.get("is_admin", False)
+    product_id = book.get("product_id", "")
+    has_access = is_admin or has_full_access or book_id in user_purchases or product_id in user_purchases
+    
+    if not has_access:
+        raise HTTPException(status_code=403, detail="Non hai accesso a questo libro")
+    
+    pdf_url = book.get("pdf_url")
+    if not pdf_url:
+        raise HTTPException(status_code=404, detail="PDF non disponibile")
+    
+    try:
+        # Scarica il PDF per ottenere il numero di pagine
+        pdf_data = await download_pdf_from_drive(pdf_url)
+        doc = pymupdf.open(stream=pdf_data, filetype="pdf")
+        num_pages = len(doc)
+        doc.close()
+        
+        return {
+            "book_id": book_id,
+            "title": book.get("title"),
+            "num_pages": num_pages
+        }
+    except Exception as e:
+        logger.error(f"Error getting book info: {e}")
+        raise HTTPException(status_code=500, detail="Errore nel caricamento del libro")
+
+
+@app.get("/api/books/{book_id}/page/{page_num}")
+async def get_book_page(
+    book_id: str, 
+    page_num: int, 
+    current_user: dict = Depends(get_current_user),
+    quality: int = 2  # 1=bassa, 2=media, 3=alta
+):
+    """Ottieni una singola pagina del libro come immagine JPEG"""
+    book = await db.books.find_one({"book_id": book_id})
+    if not book:
+        raise HTTPException(status_code=404, detail="Libro non trovato")
+    
+    user_purchases = current_user.get("purchases", [])
+    has_full_access = "books_full_access" in user_purchases
+    is_admin = current_user.get("is_admin", False)
+    product_id = book.get("product_id", "")
+    has_access = is_admin or has_full_access or book_id in user_purchases or product_id in user_purchases
+    
+    if not has_access:
+        raise HTTPException(status_code=403, detail="Non hai accesso a questo libro")
+    
+    pdf_url = book.get("pdf_url")
+    if not pdf_url:
+        raise HTTPException(status_code=404, detail="PDF non disponibile")
+    
+    try:
+        # Scarica il PDF
+        pdf_data = await download_pdf_from_drive(pdf_url)
+        doc = pymupdf.open(stream=pdf_data, filetype="pdf")
+        
+        if page_num < 0 or page_num >= len(doc):
+            doc.close()
+            raise HTTPException(status_code=404, detail="Pagina non trovata")
+        
+        page = doc[page_num]
+        
+        # Zoom in base alla qualità richiesta (2 = ~150 DPI, 3 = ~225 DPI)
+        zoom = min(max(quality, 1), 3)  # Limita tra 1 e 3
+        mat = pymupdf.Matrix(zoom, zoom)
+        
+        # Renderizza la pagina come immagine
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Converti in JPEG
+        img_data = pix.tobytes("jpeg")
+        
+        doc.close()
+        
+        return Response(
+            content=img_data,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "private, max-age=300",  # Cache 5 minuti
+                "X-Page-Number": str(page_num),
+                "X-Total-Pages": str(len(doc)) if doc else "0"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error rendering page: {e}")
+        raise HTTPException(status_code=500, detail="Errore nel rendering della pagina")
 
 # -----------------------------------------------------------------------------
 # IAP ENDPOINTS
@@ -787,8 +1164,10 @@ async def restore_purchases(current_user: dict = Depends(get_current_user)):
 @app.get("/api/news")
 async def get_news():
     news = await db.news.find().sort("created_at", -1).to_list(100)
-    return [{"news_id": n.get("news_id"), "title": n.get("title"), "content": n.get("content"), 
-             "image_url": n.get("image_url"), "created_at": n.get("created_at")} for n in news]
+    return [{"news_id": n.get("news_id"), "title": n.get("title"), "link": n.get("link"),
+             "content": n.get("content"), "image_url": n.get("image_url"), 
+             "has_ticket": n.get("has_ticket", False), "price": n.get("price"),
+             "created_at": n.get("created_at")} for n in news]
 
 # -----------------------------------------------------------------------------
 # TUTORIALS ENDPOINTS
@@ -827,7 +1206,7 @@ async def get_tutorials(current_user: dict = Depends(get_current_user)):
 @app.get("/api/blog")
 async def get_blog():
     posts = await db.blog.find().sort("created_at", -1).to_list(100)
-    return [{"post_id": p.get("post_id"), "title": p.get("title"), "url": p.get("url"),
+    return [{"post_id": p.get("post_id"), "title": p.get("title"), "url": p.get("link"),
              "image_url": p.get("image_url"), "created_at": p.get("created_at")} for p in posts]
 
 @app.get("/api/latest-updates")
@@ -1347,6 +1726,88 @@ async def delete_market_item(item_id: str, admin: dict = Depends(get_admin_user)
     return {"message": "Prodotto eliminato"}
 
 # -----------------------------------------------------------------------------
+# ADMIN LINKS ENDPOINTS
+# -----------------------------------------------------------------------------
+
+def generate_link_id() -> str:
+    return f"link_{secrets.token_hex(6)}"
+
+class SocialLinkCreate(BaseModel):
+    title: str
+    url: str
+    icon: str = "link-outline"  # Ionicons icon name
+    color: str = "#3B82F6"  # Hex color
+    order: int = 0
+
+# Endpoint pubblico per i links
+@app.get("/api/links")
+async def get_social_links():
+    """Lista links per tutti gli utenti"""
+    links = await db.social_links.find().sort("order", 1).to_list(50)
+    return [{
+        "link_id": l.get("link_id"),
+        "title": l.get("title"),
+        "url": l.get("url"),
+        "icon": l.get("icon", "link-outline"),
+        "color": l.get("color", "#3B82F6"),
+        "order": l.get("order", 0)
+    } for l in links]
+
+@app.get("/api/admin/links")
+async def get_all_links_admin(admin: dict = Depends(get_admin_user)):
+    """Lista links per admin"""
+    links = await db.social_links.find().sort("order", 1).to_list(50)
+    return [{
+        "link_id": l.get("link_id"),
+        "title": l.get("title"),
+        "url": l.get("url"),
+        "icon": l.get("icon", "link-outline"),
+        "color": l.get("color", "#3B82F6"),
+        "order": l.get("order", 0)
+    } for l in links]
+
+@app.post("/api/admin/links")
+async def create_social_link(link: SocialLinkCreate, admin: dict = Depends(get_admin_user)):
+    """Crea un nuovo link"""
+    link_data = {
+        "link_id": generate_link_id(),
+        "title": link.title,
+        "url": link.url,
+        "icon": link.icon,
+        "color": link.color,
+        "order": link.order,
+        "created_at": datetime.utcnow()
+    }
+    await db.social_links.insert_one(link_data)
+    link_data.pop('_id', None)
+    return link_data
+
+@app.put("/api/admin/links/{link_id}")
+async def update_social_link(link_id: str, link: SocialLinkCreate, admin: dict = Depends(get_admin_user)):
+    """Aggiorna un link esistente"""
+    result = await db.social_links.update_one(
+        {"link_id": link_id},
+        {"$set": {
+            "title": link.title,
+            "url": link.url,
+            "icon": link.icon,
+            "color": link.color,
+            "order": link.order
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Link non trovato")
+    return {"message": "Link aggiornato"}
+
+@app.delete("/api/admin/links/{link_id}")
+async def delete_social_link(link_id: str, admin: dict = Depends(get_admin_user)):
+    """Elimina un link"""
+    result = await db.social_links.delete_one({"link_id": link_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Link non trovato")
+    return {"message": "Link eliminato"}
+
+# -----------------------------------------------------------------------------
 # ADMIN SECTIONS ENDPOINTS
 # -----------------------------------------------------------------------------
 
@@ -1415,6 +1876,157 @@ async def delete_blog_post(post_id: str, admin: dict = Depends(get_admin_user)):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Articolo non trovato")
     return {"message": "Articolo eliminato"}
+
+# =============================================================================
+# CALENDAR CLOUD SYNC
+# =============================================================================
+
+def generate_event_id() -> str:
+    return f"evt_{secrets.token_hex(8)}"
+
+class CalendarEventCreate(BaseModel):
+    date: str  # Formato: YYYY-MM-DD
+    time: str  # Formato: HH:MM
+    text: str
+
+class CalendarEventUpdate(BaseModel):
+    time: Optional[str] = None
+    text: Optional[str] = None
+
+class CalendarSettingsUpdate(BaseModel):
+    notificationEnabled: bool = True
+    notificationTime: str = "08:00"
+    dayBeforeEnabled: bool = False
+    dayBeforeTime: str = "19:00"
+
+@app.get("/api/calendar/events")
+async def get_calendar_events(current_user: dict = Depends(get_current_user)):
+    """Ottieni tutti gli eventi del calendario dell'utente"""
+    events = await db.calendar_events.find({"user_id": current_user["user_id"]}).to_list(1000)
+    
+    # Raggruppa per data (formato compatibile con il frontend)
+    events_by_date = {}
+    for event in events:
+        date_key = event.get("date")
+        if date_key not in events_by_date:
+            events_by_date[date_key] = []
+        events_by_date[date_key].append({
+            "id": event.get("event_id"),
+            "time": event.get("time"),
+            "text": event.get("text"),
+        })
+    
+    return {"events": events_by_date}
+
+@app.post("/api/calendar/events")
+async def create_calendar_event(
+    event: CalendarEventCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Crea un nuovo evento nel calendario"""
+    event_id = generate_event_id()
+    event_data = {
+        "event_id": event_id,
+        "user_id": current_user["user_id"],
+        "date": event.date,
+        "time": event.time,
+        "text": event.text,
+        "created_at": datetime.utcnow(),
+    }
+    await db.calendar_events.insert_one(event_data)
+    
+    return {
+        "id": event_id,
+        "date": event.date,
+        "time": event.time,
+        "text": event.text,
+    }
+
+@app.put("/api/calendar/events/{event_id}")
+async def update_calendar_event(
+    event_id: str,
+    event: CalendarEventUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Aggiorna un evento esistente"""
+    # Verifica che l'evento appartenga all'utente
+    existing = await db.calendar_events.find_one({
+        "event_id": event_id,
+        "user_id": current_user["user_id"]
+    })
+    if not existing:
+        raise HTTPException(status_code=404, detail="Evento non trovato")
+    
+    update_data = {}
+    if event.time is not None:
+        update_data["time"] = event.time
+    if event.text is not None:
+        update_data["text"] = event.text
+    
+    if update_data:
+        await db.calendar_events.update_one(
+            {"event_id": event_id},
+            {"$set": update_data}
+        )
+    
+    return {"message": "Evento aggiornato"}
+
+@app.delete("/api/calendar/events/{event_id}")
+async def delete_calendar_event(
+    event_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Elimina un evento"""
+    result = await db.calendar_events.delete_one({
+        "event_id": event_id,
+        "user_id": current_user["user_id"]
+    })
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Evento non trovato")
+    
+    return {"message": "Evento eliminato"}
+
+@app.get("/api/calendar/settings")
+async def get_calendar_settings(current_user: dict = Depends(get_current_user)):
+    """Ottieni le impostazioni del calendario dell'utente"""
+    settings = await db.calendar_settings.find_one({"user_id": current_user["user_id"]})
+    
+    if not settings:
+        # Restituisci impostazioni di default
+        return {
+            "notificationEnabled": True,
+            "notificationTime": "08:00",
+            "dayBeforeEnabled": False,
+            "dayBeforeTime": "19:00",
+        }
+    
+    return {
+        "notificationEnabled": settings.get("notificationEnabled", True),
+        "notificationTime": settings.get("notificationTime", "08:00"),
+        "dayBeforeEnabled": settings.get("dayBeforeEnabled", False),
+        "dayBeforeTime": settings.get("dayBeforeTime", "19:00"),
+    }
+
+@app.put("/api/calendar/settings")
+async def update_calendar_settings(
+    settings: CalendarSettingsUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Aggiorna le impostazioni del calendario"""
+    await db.calendar_settings.update_one(
+        {"user_id": current_user["user_id"]},
+        {"$set": {
+            "user_id": current_user["user_id"],
+            "notificationEnabled": settings.notificationEnabled,
+            "notificationTime": settings.notificationTime,
+            "dayBeforeEnabled": settings.dayBeforeEnabled,
+            "dayBeforeTime": settings.dayBeforeTime,
+            "updated_at": datetime.utcnow(),
+        }},
+        upsert=True
+    )
+    
+    return {"message": "Impostazioni salvate"}
 
 # =============================================================================
 # ADMIN WEB PANEL
@@ -2419,6 +3031,346 @@ async def update_home_badge(
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
+# HOME BANNERS (Slideshow in home)
+# =============================================================================
+
+@app.get("/api/home-banners")
+async def get_home_banners():
+    """Get all active home banners for slideshow"""
+    try:
+        banners = await db.home_banners.find({"active": True}).sort("order", 1).to_list(6)
+        result = []
+        for banner in banners:
+            # Se l'immagine è base64 nel DB, usa quella. Altrimenti usa l'URL legacy
+            image_data = banner.get("image_base64") or banner.get("image_url", "")
+            result.append({
+                "id": banner.get("banner_id"),
+                "image_url": image_data,
+                "link_type": banner.get("link_type", "none"),
+                "link_url": banner.get("link_url", ""),
+                "order": banner.get("order", 0),
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching home banners: {e}")
+        return []
+
+@app.get("/api/admin/home-banners")
+async def get_admin_home_banners(current_user: dict = Depends(get_current_user)):
+    """Get all home banners for admin (including inactive)"""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Solo admin")
+    
+    try:
+        banners = await db.home_banners.find().sort("order", 1).to_list(10)
+        result = []
+        for banner in banners:
+            # Se l'immagine è base64 nel DB, usa quella
+            image_data = banner.get("image_base64") or banner.get("image_url", "")
+            result.append({
+                "id": banner.get("banner_id"),
+                "image_url": image_data,
+                "link_type": banner.get("link_type", "none"),
+                "link_url": banner.get("link_url", ""),
+                "order": banner.get("order", 0),
+                "active": banner.get("active", True),
+                "created_at": banner.get("created_at", "").isoformat() if banner.get("created_at") else None,
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching admin home banners: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/home-banners")
+async def create_home_banner(
+    banner_data: HomeBannerCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new home banner - salva immagine come base64 nel DB"""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Solo admin")
+    
+    # Check max 6 banners
+    count = await db.home_banners.count_documents({})
+    if count >= 6:
+        raise HTTPException(status_code=400, detail="Massimo 6 banner. Elimina uno esistente prima.")
+    
+    try:
+        banner_id = f"banner_{secrets.token_hex(6)}"
+        
+        # Salva l'immagine base64 direttamente nel database (persistente)
+        image_base64 = banner_data.image_base64
+        
+        banner = {
+            "banner_id": banner_id,
+            "image_base64": image_base64,  # Salva base64 nel DB
+            "image_url": "",  # Legacy field, vuoto
+            "link_type": banner_data.link_type,
+            "link_url": banner_data.link_url,
+            "order": banner_data.order,
+            "active": banner_data.active,
+            "created_at": datetime.utcnow(),
+        }
+        
+        await db.home_banners.insert_one(banner)
+        
+        return {
+            "success": True,
+            "message": "Banner creato",
+            "banner": {
+                "id": banner_id,
+                "image_url": image_base64,
+                "link_type": banner_data.link_type,
+                "link_url": banner_data.link_url,
+                "order": banner_data.order,
+                "active": banner_data.active,
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error creating home banner: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/home-banners/{banner_id}")
+async def update_home_banner(
+    banner_id: str,
+    banner_data: HomeBannerUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update a home banner - salva immagine come base64 nel DB"""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Solo admin")
+    
+    try:
+        update_data = {"updated_at": datetime.utcnow()}
+        
+        if banner_data.image_base64:
+            # Salva la nuova immagine base64 nel database
+            update_data["image_base64"] = banner_data.image_base64
+            update_data["image_url"] = ""  # Clear legacy field
+        
+        if banner_data.link_type is not None:
+            update_data["link_type"] = banner_data.link_type
+        if banner_data.link_url is not None:
+            update_data["link_url"] = banner_data.link_url
+        if banner_data.order is not None:
+            update_data["order"] = banner_data.order
+        if banner_data.active is not None:
+            update_data["active"] = banner_data.active
+        
+        result = await db.home_banners.update_one(
+            {"banner_id": banner_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Banner non trovato")
+        
+        return {"success": True, "message": "Banner aggiornato"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating home banner: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/admin/home-banners/{banner_id}")
+async def delete_home_banner(
+    banner_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a home banner"""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Solo admin")
+    
+    try:
+        result = await db.home_banners.delete_one({"banner_id": banner_id})
+        
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Banner non trovato")
+        
+        return {"success": True, "message": "Banner eliminato"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting home banner: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =============================================================================
+# IMAGE ANALYSIS (Strumento Analisi PRO)
+# =============================================================================
+
+from PIL import Image
+import io
+import base64
+from collections import Counter
+
+class ImageAnalysisRequest(BaseModel):
+    image_base64: str  # Base64 encoded image
+
+class ImageAnalysisResponse(BaseModel):
+    histogram: dict  # r, g, b, lum arrays
+    colors: dict  # dominant, palette, temperature, saturation
+    exposure: dict  # avgBrightness, shadows, midtones, highlights, clipping
+
+@app.post("/api/analyze-image", response_model=ImageAnalysisResponse)
+async def analyze_image(request: ImageAnalysisRequest):
+    """
+    Analizza un'immagine e restituisce istogramma reale, colori dominanti e dati esposizione.
+    Questo endpoint processa l'immagine usando PIL/Pillow per analisi pixel-level.
+    """
+    try:
+        # Decodifica l'immagine base64
+        image_data = request.image_base64
+        # Rimuovi header se presente (es: "data:image/jpeg;base64,")
+        if "," in image_data:
+            image_data = image_data.split(",")[1]
+        
+        image_bytes = base64.b64decode(image_data)
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Converti in RGB se necessario
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Ridimensiona per performance (max 800px sul lato lungo)
+        max_size = 800
+        ratio = min(max_size / image.width, max_size / image.height)
+        if ratio < 1:
+            new_size = (int(image.width * ratio), int(image.height * ratio))
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # ===== CALCOLO ISTOGRAMMA REALE =====
+        # Ottieni i dati dei pixel
+        pixels = list(image.getdata())
+        width, height = image.size
+        total_pixels = width * height
+        
+        # Inizializza bins (64 bins per canale, come nel frontend)
+        num_bins = 64
+        r_hist = [0] * num_bins
+        g_hist = [0] * num_bins
+        b_hist = [0] * num_bins
+        lum_hist = [0] * num_bins
+        
+        # Variabili per analisi colori
+        all_colors = []
+        brightness_sum = 0
+        
+        # Processa ogni pixel
+        for r, g, b in pixels:
+            # Bin index (0-255 -> 0-63)
+            r_bin = min(r * num_bins // 256, num_bins - 1)
+            g_bin = min(g * num_bins // 256, num_bins - 1)
+            b_bin = min(b * num_bins // 256, num_bins - 1)
+            
+            # Luminosità (formula standard)
+            lum = int(0.299 * r + 0.587 * g + 0.114 * b)
+            lum_bin = min(lum * num_bins // 256, num_bins - 1)
+            
+            r_hist[r_bin] += 1
+            g_hist[g_bin] += 1
+            b_hist[b_bin] += 1
+            lum_hist[lum_bin] += 1
+            
+            brightness_sum += lum
+            
+            # Quantizza colore per analisi dominante (dividi per 32 per ridurre variazioni)
+            quantized = ((r // 32) * 32, (g // 32) * 32, (b // 32) * 32)
+            all_colors.append(quantized)
+        
+        # Normalizza istogrammi (0-1)
+        max_r = max(r_hist) if max(r_hist) > 0 else 1
+        max_g = max(g_hist) if max(g_hist) > 0 else 1
+        max_b = max(b_hist) if max(b_hist) > 0 else 1
+        max_lum = max(lum_hist) if max(lum_hist) > 0 else 1
+        
+        histogram = {
+            "r": [v / max_r for v in r_hist],
+            "g": [v / max_g for v in g_hist],
+            "b": [v / max_b for v in b_hist],
+            "lum": [v / max_lum for v in lum_hist],
+        }
+        
+        # ===== ANALISI COLORI =====
+        # Trova i colori più comuni
+        color_counter = Counter(all_colors)
+        top_colors = color_counter.most_common(6)
+        
+        dominant_rgb = top_colors[0][0] if top_colors else (128, 128, 128)
+        
+        # Converti in stringa hex
+        dominant_hex = '#{:02x}{:02x}{:02x}'.format(*dominant_rgb)
+        palette_hex = ['#{:02x}{:02x}{:02x}'.format(*c[0]) for c in top_colors[1:6]]
+        
+        # Calcola temperatura colore (basato sul rapporto R/B)
+        avg_r = sum(p[0] for p in pixels) / total_pixels
+        avg_g = sum(p[1] for p in pixels) / total_pixels
+        avg_b = sum(p[2] for p in pixels) / total_pixels
+        
+        # Colore MEDIO dell'immagine (utile per colorimetro e white balance)
+        average_hex = '#{:02x}{:02x}{:02x}'.format(int(avg_r), int(avg_g), int(avg_b))
+        
+        if avg_r > avg_b * 1.1:
+            temperature = "caldo"
+        elif avg_b > avg_r * 1.1:
+            temperature = "freddo"
+        else:
+            temperature = "neutro"
+        
+        # Calcola saturazione media
+        saturations = []
+        for r, g, b in pixels[:10000]:  # Campiona per performance
+            max_c = max(r, g, b)
+            min_c = min(r, g, b)
+            if max_c > 0:
+                sat = (max_c - min_c) / max_c * 100
+                saturations.append(sat)
+        avg_saturation = int(sum(saturations) / len(saturations)) if saturations else 50
+        
+        colors = {
+            "dominant": dominant_hex,
+            "average": average_hex,  # Colore MEDIO (per colorimetro/white balance)
+            "palette": palette_hex,
+            "temperature": temperature,
+            "saturation": avg_saturation,
+        }
+        
+        # ===== ANALISI ESPOSIZIONE =====
+        avg_brightness = int(brightness_sum / total_pixels)
+        
+        # Calcola distribuzione zone
+        third = num_bins // 3
+        shadows_count = sum(lum_hist[:third])
+        midtones_count = sum(lum_hist[third:2*third])
+        highlights_count = sum(lum_hist[2*third:])
+        
+        shadows_pct = int(shadows_count / total_pixels * 100)
+        midtones_pct = int(midtones_count / total_pixels * 100)
+        highlights_pct = int(highlights_count / total_pixels * 100)
+        
+        # Clipping detection (primi e ultimi 3 bins)
+        clipped_shadows = int(sum(lum_hist[:3]) / total_pixels * 100)
+        clipped_highlights = int(sum(lum_hist[-3:]) / total_pixels * 100)
+        
+        exposure = {
+            "avgBrightness": avg_brightness,
+            "shadows": shadows_pct,
+            "midtones": midtones_pct,
+            "highlights": highlights_pct,
+            "clippedShadows": clipped_shadows,
+            "clippedHighlights": clipped_highlights,
+        }
+        
+        return ImageAnalysisResponse(
+            histogram=histogram,
+            colors=colors,
+            exposure=exposure,
+        )
+        
+    except Exception as e:
+        logger.error(f"Error analyzing image: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore nell'analisi dell'immagine: {str(e)}")
+
+# =============================================================================
 # PROJECT DOWNLOAD
 # =============================================================================
 
@@ -2440,7 +3392,7 @@ async def download_project():
 
 @app.on_event("startup")
 async def startup():
-    logger.info(f"Starting Lumina Ingegno V2 API")
+    logger.info("Starting Lumina Ingegno V2 API")
     logger.info(f"Database: {DB_NAME}")
     
     admin = await db.users.find_one({"email": ADMIN_EMAIL.lower()})
