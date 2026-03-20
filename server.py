@@ -3387,6 +3387,46 @@ async def download_project():
     )
 
 # =============================================================================
+# PROMO PRO URL
+# =============================================================================
+
+@app.get("/api/promo-url")
+async def get_promo_url():
+    """Ottieni l'URL della pagina promo PRO"""
+    settings = await db.settings.find_one({"type": "promo_pro"})
+    if settings and settings.get("url"):
+        return {"url": settings["url"]}
+    # URL di default se non configurato
+    return {"url": "https://luminaingegno.com/pro"}
+
+@app.get("/api/admin/promo-url")
+async def admin_get_promo_url(current_user: dict = Depends(get_current_user)):
+    """Admin: ottieni URL promo PRO"""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    
+    settings = await db.settings.find_one({"type": "promo_pro"})
+    if settings:
+        return {"url": settings.get("url", "")}
+    return {"url": ""}
+
+@app.put("/api/admin/promo-url")
+async def admin_update_promo_url(data: dict, current_user: dict = Depends(get_current_user)):
+    """Admin: aggiorna URL promo PRO"""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Accesso negato")
+    
+    url = data.get("url", "")
+    
+    await db.settings.update_one(
+        {"type": "promo_pro"},
+        {"$set": {"url": url, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+    
+    return {"success": True, "url": url}
+
+# =============================================================================
 # STARTUP
 # =============================================================================
 
