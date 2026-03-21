@@ -382,6 +382,7 @@ scheduler = AsyncIOScheduler()
 async def check_and_send_scheduled_notifications():
     """
     Controlla ogni minuto se ci sono notifiche programmate da inviare.
+    Invia SOLO a utenti iOS via APNs diretto.
     """
     try:
         now = datetime.utcnow()
@@ -395,31 +396,25 @@ async def check_and_send_scheduled_notifications():
         for notif in pending:
             logger.info(f"Sending scheduled notification: {notif['title']}")
             
-            # Invia la notifica a tutti gli utenti
-            users = await db.users.find({"push_token": {"$exists": True, "$ne": None}}).to_list(1000)
+            # Invia la notifica SOLO a utenti iOS
+            users = await db.users.find({
+                "push_token": {"$exists": True, "$ne": None},
+                "push_platform": "ios"
+            }).to_list(1000)
             
             sent_ios = 0
-            sent_android = 0
             errors = 0
             
             for user in users:
                 try:
-                    platform = user.get("push_platform", "android")
-                    token = user["push_token"]
-                    
-                    if platform == "ios":
-                        apns_token = user.get("push_token_original", token)
+                    apns_token = user.get("push_token_original", user.get("push_token"))
+                    if apns_token:
                         result = await send_apns_push(apns_token, notif["title"], notif["body"])
                         if result.get("success"):
                             sent_ios += 1
                         else:
                             errors += 1
-                    else:
-                        result = await send_fcm_push(token, notif["title"], notif["body"])
-                        if result.get("success"):
-                            sent_android += 1
-                        else:
-                            errors += 1
+                            logger.error(f"Scheduled push failed for {user['email']}: {result.get('error')}")
                 except Exception as e:
                     logger.error(f"Error sending scheduled push to {user.get('email')}: {e}")
                     errors += 1
@@ -432,13 +427,12 @@ async def check_and_send_scheduled_notifications():
                     "sent_at": datetime.utcnow(),
                     "result": {
                         "sent_ios": sent_ios,
-                        "sent_android": sent_android,
                         "errors": errors
                     }
                 }}
             )
             
-            logger.info(f"Scheduled notification sent: {sent_ios} iOS, {sent_android} Android, {errors} errors")
+            logger.info(f"Scheduled notification sent: {sent_ios} iOS, {errors} errors")
             
     except Exception as e:
         logger.error(f"Error checking scheduled notifications: {e}")
@@ -1466,64 +1460,66 @@ async def send_notification_to_all(
     admin: dict = Depends(get_admin_user)
 ):
     """
-    Send push notification to all users.
-    - iOS: Usa APNs diretto (più affidabile)
-    - Android: Usa Firebase Cloud Messaging
+    Send push notification SOLO a utenti iOS via APNs diretto.
+    Per Android usare Firebase Console.
     """
-    users = await db.users.find({"push_token": {"$exists": True, "$ne": None}}).to_list(1000)
+    # Filtra SOLO utenti iOS
+    users = await db.users.find({
+        "push_token": {"$exists": True, "$ne": None},
+        "push_platform": "ios"
+    }).to_list(1000)
     
     sent_ios = 0
-    sent_android = 0
     errors = 0
     unregistered = 0
+    error_details = []
+    
+    logger.info(f"Sending notification to {len(users)} iOS users")
     
     for user in users:
         try:
-            platform = user.get("push_platform", "android")
-            token = user["push_token"]
+            # Usa il token APNs originale
+            apns_token = user.get("push_token_original", user.get("push_token"))
             
-            # Per iOS, usa il token APNs originale se disponibile, altrimenti usa push_token
-            if platform == "ios":
-                # Usa il token APNs originale per invio diretto
-                apns_token = user.get("push_token_original", token)
-                result = await send_apns_push(apns_token, notification.title, notification.body)
-                if result.get("success"):
-                    sent_ios += 1
-                elif result.get("error") == "Token unregistered":
-                    unregistered += 1
-                    await db.users.update_one(
-                        {"user_id": user["user_id"]},
-                        {"$unset": {"push_token": "", "push_token_original": ""}}
-                    )
-                else:
-                    errors += 1
-                    logger.warning(f"iOS push failed for {user['email']}: {result.get('error')}")
+            if not apns_token:
+                logger.warning(f"No APNs token for {user['email']}")
+                errors += 1
+                continue
+                
+            logger.info(f"Sending to {user['email']}: token={apns_token[:30]}...")
+            
+            result = await send_apns_push(apns_token, notification.title, notification.body)
+            
+            if result.get("success"):
+                sent_ios += 1
+                logger.info(f"SUCCESS for {user['email']}")
+            elif result.get("error") == "Token unregistered":
+                unregistered += 1
+                await db.users.update_one(
+                    {"user_id": user["user_id"]},
+                    {"$unset": {"push_token": "", "push_token_original": ""}}
+                )
+                logger.warning(f"Token unregistered for {user['email']}")
             else:
-                # Android: usa FCM come prima
-                result = await send_fcm_push(token, notification.title, notification.body)
-                if result.get("success"):
-                    sent_android += 1
-                elif result.get("error") == "Token unregistered":
-                    unregistered += 1
-                    await db.users.update_one(
-                        {"user_id": user["user_id"]},
-                        {"$unset": {"push_token": ""}}
-                    )
-                else:
-                    errors += 1
+                errors += 1
+                error_msg = result.get('error', 'Unknown error')
+                error_details.append(f"{user['email']}: {error_msg}")
+                logger.error(f"FAILED for {user['email']}: {error_msg}")
+                
         except Exception as e:
-            logger.error(f"Error sending push to {user['email']}: {e}")
+            logger.error(f"Exception sending push to {user['email']}: {e}")
             errors += 1
+            error_details.append(f"{user['email']}: {str(e)}")
     
-    total_sent = sent_ios + sent_android
     return {
-        "sent": total_sent,
+        "sent": sent_ios,
         "sent_ios": sent_ios,
-        "sent_android": sent_android,
+        "sent_android": 0,  # Non inviamo più ad Android da qui
         "errors": errors, 
         "unregistered": unregistered,
-        "total": len(users),
-        "message": f"Notifica inviata: {sent_ios} iOS, {sent_android} Android" if total_sent > 0 else "Nessuna notifica inviata"
+        "total_ios_users": len(users),
+        "error_details": error_details[:5],  # Max 5 errori per non sovraccaricare
+        "message": f"Notifica inviata a {sent_ios} utenti iOS" if sent_ios > 0 else "Nessuna notifica inviata (controlla se ci sono utenti iOS registrati)"
     }
 
 # -----------------------------------------------------------------------------
@@ -2424,27 +2420,31 @@ ADMIN_HTML = """
 
             <!-- Notifications Tab -->
             <div id="notificationsTab" class="card">
-                <h2>📢 Notifiche Push</h2>
+                <h2>🍎 Notifiche Push iOS</h2>
+                <p style="color: #888; margin-bottom: 15px; font-size: 13px;">
+                    Questo pannello invia notifiche solo a dispositivi iOS via APNs.<br>
+                    Per Android usa <a href="https://console.firebase.google.com" target="_blank" style="color: #4CAF50;">Firebase Console</a>
+                </p>
                 
                 <!-- Invio Immediato -->
                 <div style="background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
-                    <h3 style="margin-bottom: 15px;">⚡ Invio Immediato</h3>
+                    <h3 style="margin-bottom: 15px;">⚡ Invio Immediato iOS</h3>
                     <input type="text" id="notifTitle" placeholder="Titolo notifica">
                     <textarea id="notifBody" placeholder="Messaggio"></textarea>
-                    <button class="btn" onclick="sendNotification()">Invia ORA a tutti</button>
+                    <button class="btn" onclick="sendNotification()">🍎 Invia ORA a iOS</button>
                     <div id="notifResult"></div>
                 </div>
                 
                 <!-- Programmazione -->
                 <div style="background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
-                    <h3 style="margin-bottom: 15px;">📅 Programma Notifica</h3>
+                    <h3 style="margin-bottom: 15px;">📅 Programma Notifica iOS</h3>
                     <input type="text" id="schedNotifTitle" placeholder="Titolo notifica">
                     <textarea id="schedNotifBody" placeholder="Messaggio"></textarea>
                     <div style="display: flex; gap: 10px; margin-bottom: 10px;">
                         <input type="date" id="schedDate" style="flex: 1; padding: 12px; background: #222; color: #fff; border: 1px solid #444; border-radius: 5px;">
                         <input type="time" id="schedTime" style="flex: 1; padding: 12px; background: #222; color: #fff; border: 1px solid #444; border-radius: 5px;">
                     </div>
-                    <button class="btn" onclick="scheduleNotification()" style="background: #8B5CF6;">📅 Programma</button>
+                    <button class="btn" onclick="scheduleNotification()" style="background: #8B5CF6;">📅 Programma iOS</button>
                     <div id="schedResult"></div>
                 </div>
                 
