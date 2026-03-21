@@ -98,9 +98,9 @@ else:
 
 # Configurazione per la conversione APNs token -> FCM token
 IOS_BUNDLE_ID = "com.ringegno.luminaingegno"
-# APNS_SANDBOX: "true" per TestFlight, "false" per App Store production
-# Configurabile via variabile d'ambiente su Railway
-APNS_SANDBOX = os.getenv("APNS_SANDBOX", "true").lower() == "true"
+# APNS_SANDBOX: "true" per development locale, "false" per TestFlight e App Store
+# IMPORTANTE: TestFlight usa l'ambiente PRODUCTION, non sandbox!
+APNS_SANDBOX = os.getenv("APNS_SANDBOX", "false").lower() == "true"
 
 # =============================================================================
 # APNs DIRECT - Configurazione per invio diretto ad Apple Push Notification Service
