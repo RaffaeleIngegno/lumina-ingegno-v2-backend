@@ -105,6 +105,7 @@ pyflakes==3.4.0
 Pygments==2.19.2
 PyJWT==2.11.0
 pymongo==4.6.1
+PyMuPDF==1.27.2.2
 pyparsing==3.3.2
 pytest==9.0.2
 python-dateutil==2.9.0.post0

@@ -102,6 +102,114 @@ IOS_BUNDLE_ID = "com.ringegno.luminaingegno"
 # Configurabile via variabile d'ambiente su Railway
 APNS_SANDBOX = os.getenv("APNS_SANDBOX", "true").lower() == "true"
 
+# =============================================================================
+# APNs DIRECT - Configurazione per invio diretto ad Apple Push Notification Service
+# =============================================================================
+APNS_KEY_ID = os.getenv("APNS_KEY_ID", "4WWUDFPP3U")
+APNS_TEAM_ID = os.getenv("APNS_TEAM_ID", "AS2H2X2A7B")
+APNS_AUTH_KEY = os.getenv("APNS_AUTH_KEY", """-----BEGIN PRIVATE KEY-----
+MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg7LpOa713J+9z2qkB
+Nm6dW4PgGuU4Ss3GYBLKDKGlPg2gCgYIKoZIzj0DAQehRANCAAQSfAdBR6Wj/A2d
+95OBwiKzBmeL9OCPfZQRD1PpPYj2mMknb0lk4rKit49Hr8PK36gNK4tGWyqzGL5g
+SEpX9KIq
+-----END PRIVATE KEY-----""")
+
+# Endpoint APNs
+APNS_HOST_SANDBOX = "api.sandbox.push.apple.com"
+APNS_HOST_PRODUCTION = "api.push.apple.com"
+
+def get_apns_host():
+    """Restituisce l'host APNs corretto in base all'ambiente"""
+    return APNS_HOST_SANDBOX if APNS_SANDBOX else APNS_HOST_PRODUCTION
+
+def create_apns_jwt_token():
+    """Crea un JWT token per autenticarsi con APNs"""
+    import time
+    
+    headers = {
+        "alg": "ES256",
+        "kid": APNS_KEY_ID,
+    }
+    
+    payload = {
+        "iss": APNS_TEAM_ID,
+        "iat": int(time.time()),
+    }
+    
+    # Usa PyJWT per firmare con ES256
+    import jwt as pyjwt
+    token = pyjwt.encode(payload, APNS_AUTH_KEY, algorithm="ES256", headers=headers)
+    return token
+
+async def send_apns_push(device_token: str, title: str, body: str, data: dict = None) -> dict:
+    """
+    Invia notifica push direttamente ad APNs (Apple Push Notification Service).
+    Questo è il metodo più affidabile per iOS.
+    """
+    import httpx
+    import json
+    
+    try:
+        # Crea JWT per autenticazione
+        jwt_token = create_apns_jwt_token()
+        
+        # Prepara il payload APNs
+        apns_payload = {
+            "aps": {
+                "alert": {
+                    "title": title,
+                    "body": body,
+                },
+                "sound": "default",
+                "badge": 1,
+            }
+        }
+        
+        # Aggiungi dati custom se presenti
+        if data:
+            apns_payload["data"] = data
+        
+        # Headers richiesti da APNs
+        headers = {
+            "authorization": f"bearer {jwt_token}",
+            "apns-topic": IOS_BUNDLE_ID,
+            "apns-push-type": "alert",
+            "apns-priority": "10",
+            "apns-expiration": "0",
+        }
+        
+        # URL endpoint APNs
+        host = get_apns_host()
+        url = f"https://{host}/3/device/{device_token}"
+        
+        logger.info(f"Sending APNs push to {device_token[:20]}... via {host}")
+        
+        # Invia richiesta HTTP/2 ad APNs
+        async with httpx.AsyncClient(http2=True) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json=apns_payload,
+                timeout=30.0
+            )
+        
+        if response.status_code == 200:
+            logger.info(f"APNs push sent successfully to {device_token[:20]}...")
+            return {"success": True, "message_id": response.headers.get("apns-id", "ok")}
+        else:
+            error_body = response.text
+            logger.error(f"APNs push failed: {response.status_code} - {error_body}")
+            
+            # Gestisci token non validi
+            if response.status_code == 410 or "BadDeviceToken" in error_body or "Unregistered" in error_body:
+                return {"success": False, "error": "Token unregistered"}
+            
+            return {"success": False, "error": f"APNs error {response.status_code}: {error_body}"}
+            
+    except Exception as e:
+        logger.error(f"APNs push exception: {e}")
+        return {"success": False, "error": str(e)}
+
 async def convert_apns_to_fcm(apns_token: str) -> str | None:
     """
     Converte un token APNs (iOS) in un token FCM registration.
@@ -743,31 +851,29 @@ async def register_push_token(
     data: PushTokenRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    token_to_save = data.token
+    """
+    Registra il push token per l'utente.
+    - iOS: salva il token APNs direttamente (per invio diretto ad Apple)
+    - Android: salva il token FCM
+    """
+    token = data.token
     platform = data.platform
-    original_token = data.token  # Salva anche il token originale per debug
     
-    # Se è iOS, converti il token APNs in token FCM
-    if platform == "ios":
-        logger.info(f"iOS token received, converting APNs to FCM for {current_user['email']}...")
-        fcm_token = await convert_apns_to_fcm(data.token)
-        if fcm_token:
-            token_to_save = fcm_token
-            logger.info(f"Successfully converted APNs to FCM for {current_user['email']}")
-        else:
-            logger.warning(f"Failed to convert APNs token for {current_user['email']}, using original token")
-            # Salviamo comunque il token originale, potrebbe essere già un FCM token
+    # Log per debug
+    logger.info(f"Push token received for {current_user['email']} (platform: {platform}, token: {token[:30]}...)")
     
+    # Salva il token - per iOS usiamo APNs diretto, niente conversione
     await db.users.update_one(
         {"user_id": current_user["user_id"]},
         {"$set": {
-            "push_token": token_to_save,
-            "push_token_original": original_token,  # Per debug
+            "push_token": token,
+            "push_token_original": token,  # Per iOS APNs diretto
             "push_platform": platform
         }}
     )
+    
     logger.info(f"Push token registered for {current_user['email']} (platform: {platform})")
-    return {"message": "Token registrato", "platform": platform, "converted": platform == "ios" and token_to_save != original_token}
+    return {"message": "Token registrato", "platform": platform}
 
 # -----------------------------------------------------------------------------
 # BOOKS ENDPOINTS
@@ -1264,37 +1370,65 @@ async def send_notification_to_all(
     notification: PushNotification,
     admin: dict = Depends(get_admin_user)
 ):
-    """Send push notification to all users via Firebase Cloud Messaging"""
+    """
+    Send push notification to all users.
+    - iOS: Usa APNs diretto (più affidabile)
+    - Android: Usa Firebase Cloud Messaging
+    """
     users = await db.users.find({"push_token": {"$exists": True, "$ne": None}}).to_list(1000)
     
-    sent = 0
+    sent_ios = 0
+    sent_android = 0
     errors = 0
     unregistered = 0
     
     for user in users:
         try:
-            result = await send_fcm_push(user["push_token"], notification.title, notification.body)
-            if result.get("success"):
-                sent += 1
-            elif result.get("error") == "Token unregistered":
-                unregistered += 1
-                # Optionally remove invalid token
-                await db.users.update_one(
-                    {"user_id": user["user_id"]},
-                    {"$unset": {"push_token": ""}}
-                )
+            platform = user.get("push_platform", "android")
+            token = user["push_token"]
+            
+            # Per iOS, usa il token APNs originale se disponibile, altrimenti usa push_token
+            if platform == "ios":
+                # Usa il token APNs originale per invio diretto
+                apns_token = user.get("push_token_original", token)
+                result = await send_apns_push(apns_token, notification.title, notification.body)
+                if result.get("success"):
+                    sent_ios += 1
+                elif result.get("error") == "Token unregistered":
+                    unregistered += 1
+                    await db.users.update_one(
+                        {"user_id": user["user_id"]},
+                        {"$unset": {"push_token": "", "push_token_original": ""}}
+                    )
+                else:
+                    errors += 1
+                    logger.warning(f"iOS push failed for {user['email']}: {result.get('error')}")
             else:
-                errors += 1
+                # Android: usa FCM come prima
+                result = await send_fcm_push(token, notification.title, notification.body)
+                if result.get("success"):
+                    sent_android += 1
+                elif result.get("error") == "Token unregistered":
+                    unregistered += 1
+                    await db.users.update_one(
+                        {"user_id": user["user_id"]},
+                        {"$unset": {"push_token": ""}}
+                    )
+                else:
+                    errors += 1
         except Exception as e:
             logger.error(f"Error sending push to {user['email']}: {e}")
             errors += 1
     
+    total_sent = sent_ios + sent_android
     return {
-        "sent": sent, 
+        "sent": total_sent,
+        "sent_ios": sent_ios,
+        "sent_android": sent_android,
         "errors": errors, 
         "unregistered": unregistered,
         "total": len(users),
-        "message": f"Notifica inviata a {sent} utenti" if sent > 0 else "Nessuna notifica inviata"
+        "message": f"Notifica inviata: {sent_ios} iOS, {sent_android} Android" if total_sent > 0 else "Nessuna notifica inviata"
     }
 
 @app.post("/api/admin/books")
