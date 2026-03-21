@@ -366,6 +366,101 @@ class HomeBannerUpdate(BaseModel):
     order: Optional[int] = None
     active: Optional[bool] = None
 
+class ScheduledNotification(BaseModel):
+    title: str
+    body: str
+    scheduled_at: str  # ISO format datetime string (es. "2026-03-25T09:00:00")
+
+# =============================================================================
+# SCHEDULED NOTIFICATIONS - APScheduler
+# =============================================================================
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+scheduler = AsyncIOScheduler()
+
+async def check_and_send_scheduled_notifications():
+    """
+    Controlla ogni minuto se ci sono notifiche programmate da inviare.
+    """
+    try:
+        now = datetime.utcnow()
+        
+        # Trova notifiche programmate che devono essere inviate
+        pending = await db.scheduled_notifications.find({
+            "scheduled_at": {"$lte": now},
+            "sent": False
+        }).to_list(100)
+        
+        for notif in pending:
+            logger.info(f"Sending scheduled notification: {notif['title']}")
+            
+            # Invia la notifica a tutti gli utenti
+            users = await db.users.find({"push_token": {"$exists": True, "$ne": None}}).to_list(1000)
+            
+            sent_ios = 0
+            sent_android = 0
+            errors = 0
+            
+            for user in users:
+                try:
+                    platform = user.get("push_platform", "android")
+                    token = user["push_token"]
+                    
+                    if platform == "ios":
+                        apns_token = user.get("push_token_original", token)
+                        result = await send_apns_push(apns_token, notif["title"], notif["body"])
+                        if result.get("success"):
+                            sent_ios += 1
+                        else:
+                            errors += 1
+                    else:
+                        result = await send_fcm_push(token, notif["title"], notif["body"])
+                        if result.get("success"):
+                            sent_android += 1
+                        else:
+                            errors += 1
+                except Exception as e:
+                    logger.error(f"Error sending scheduled push to {user.get('email')}: {e}")
+                    errors += 1
+            
+            # Segna come inviata
+            await db.scheduled_notifications.update_one(
+                {"_id": notif["_id"]},
+                {"$set": {
+                    "sent": True,
+                    "sent_at": datetime.utcnow(),
+                    "result": {
+                        "sent_ios": sent_ios,
+                        "sent_android": sent_android,
+                        "errors": errors
+                    }
+                }}
+            )
+            
+            logger.info(f"Scheduled notification sent: {sent_ios} iOS, {sent_android} Android, {errors} errors")
+            
+    except Exception as e:
+        logger.error(f"Error checking scheduled notifications: {e}")
+
+@app.on_event("startup")
+async def start_scheduler():
+    """Avvia lo scheduler all'avvio dell'app"""
+    scheduler.add_job(
+        check_and_send_scheduled_notifications,
+        IntervalTrigger(minutes=1),
+        id="check_scheduled_notifications",
+        replace_existing=True
+    )
+    scheduler.start()
+    logger.info("Scheduler started - checking notifications every minute")
+
+@app.on_event("shutdown")
+async def shutdown_scheduler():
+    """Ferma lo scheduler alla chiusura dell'app"""
+    scheduler.shutdown()
+    logger.info("Scheduler stopped")
+
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
@@ -1431,6 +1526,90 @@ async def send_notification_to_all(
         "message": f"Notifica inviata: {sent_ios} iOS, {sent_android} Android" if total_sent > 0 else "Nessuna notifica inviata"
     }
 
+# -----------------------------------------------------------------------------
+# SCHEDULED NOTIFICATIONS ENDPOINTS
+# -----------------------------------------------------------------------------
+
+@app.post("/api/admin/schedule-notification")
+async def schedule_notification(
+    notification: ScheduledNotification,
+    admin: dict = Depends(get_admin_user)
+):
+    """Programma una notifica per essere inviata in futuro"""
+    try:
+        # Parsa la data/ora
+        scheduled_at = datetime.fromisoformat(notification.scheduled_at.replace('Z', '+00:00'))
+        
+        # Verifica che la data sia nel futuro
+        if scheduled_at <= datetime.utcnow():
+            raise HTTPException(status_code=400, detail="La data deve essere nel futuro")
+        
+        # Salva la notifica programmata
+        notif_data = {
+            "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+            "title": notification.title,
+            "body": notification.body,
+            "scheduled_at": scheduled_at,
+            "created_at": datetime.utcnow(),
+            "created_by": admin["email"],
+            "sent": False,
+            "sent_at": None,
+            "result": None
+        }
+        
+        await db.scheduled_notifications.insert_one(notif_data)
+        
+        logger.info(f"Notification scheduled for {scheduled_at} by {admin['email']}")
+        
+        return {
+            "message": "Notifica programmata con successo",
+            "notification_id": notif_data["notification_id"],
+            "scheduled_at": scheduled_at.isoformat()
+        }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Formato data non valido: {str(e)}")
+
+@app.get("/api/admin/scheduled-notifications")
+async def get_scheduled_notifications(admin: dict = Depends(get_admin_user)):
+    """Ottieni lista delle notifiche programmate"""
+    notifications = await db.scheduled_notifications.find().sort("scheduled_at", 1).to_list(100)
+    
+    return [
+        {
+            "notification_id": n.get("notification_id"),
+            "title": n.get("title"),
+            "body": n.get("body"),
+            "scheduled_at": n.get("scheduled_at").isoformat() if n.get("scheduled_at") else None,
+            "created_at": n.get("created_at").isoformat() if n.get("created_at") else None,
+            "created_by": n.get("created_by"),
+            "sent": n.get("sent", False),
+            "sent_at": n.get("sent_at").isoformat() if n.get("sent_at") else None,
+            "result": n.get("result")
+        }
+        for n in notifications
+    ]
+
+@app.delete("/api/admin/scheduled-notifications/{notification_id}")
+async def delete_scheduled_notification(
+    notification_id: str,
+    admin: dict = Depends(get_admin_user)
+):
+    """Cancella una notifica programmata (solo se non ancora inviata)"""
+    notif = await db.scheduled_notifications.find_one({"notification_id": notification_id})
+    
+    if not notif:
+        raise HTTPException(status_code=404, detail="Notifica non trovata")
+    
+    if notif.get("sent"):
+        raise HTTPException(status_code=400, detail="Impossibile cancellare una notifica già inviata")
+    
+    await db.scheduled_notifications.delete_one({"notification_id": notification_id})
+    
+    logger.info(f"Scheduled notification {notification_id} deleted by {admin['email']}")
+    
+    return {"message": "Notifica cancellata"}
+
 @app.post("/api/admin/books")
 async def create_book(book: BookCreate, admin: dict = Depends(get_admin_user)):
     book_data = {
@@ -2245,11 +2424,36 @@ ADMIN_HTML = """
 
             <!-- Notifications Tab -->
             <div id="notificationsTab" class="card">
-                <h2>📢 Invia Notifica Push</h2>
-                <input type="text" id="notifTitle" placeholder="Titolo notifica">
-                <textarea id="notifBody" placeholder="Messaggio"></textarea>
-                <button class="btn" onclick="sendNotification()">Invia a tutti gli utenti</button>
-                <div id="notifResult"></div>
+                <h2>📢 Notifiche Push</h2>
+                
+                <!-- Invio Immediato -->
+                <div style="background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                    <h3 style="margin-bottom: 15px;">⚡ Invio Immediato</h3>
+                    <input type="text" id="notifTitle" placeholder="Titolo notifica">
+                    <textarea id="notifBody" placeholder="Messaggio"></textarea>
+                    <button class="btn" onclick="sendNotification()">Invia ORA a tutti</button>
+                    <div id="notifResult"></div>
+                </div>
+                
+                <!-- Programmazione -->
+                <div style="background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                    <h3 style="margin-bottom: 15px;">📅 Programma Notifica</h3>
+                    <input type="text" id="schedNotifTitle" placeholder="Titolo notifica">
+                    <textarea id="schedNotifBody" placeholder="Messaggio"></textarea>
+                    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                        <input type="date" id="schedDate" style="flex: 1; padding: 12px; background: #222; color: #fff; border: 1px solid #444; border-radius: 5px;">
+                        <input type="time" id="schedTime" style="flex: 1; padding: 12px; background: #222; color: #fff; border: 1px solid #444; border-radius: 5px;">
+                    </div>
+                    <button class="btn" onclick="scheduleNotification()" style="background: #8B5CF6;">📅 Programma</button>
+                    <div id="schedResult"></div>
+                </div>
+                
+                <!-- Lista Programmate -->
+                <div style="background: #1a1a1a; padding: 15px; border-radius: 8px;">
+                    <h3 style="margin-bottom: 15px;">📋 Notifiche Programmate</h3>
+                    <button class="btn btn-secondary" onclick="loadScheduledNotifications()" style="margin-bottom: 15px;">🔄 Aggiorna</button>
+                    <div id="scheduledList"></div>
+                </div>
             </div>
 
             <!-- Users Tab -->
@@ -2445,6 +2649,9 @@ ADMIN_HTML = """
         }
 
         async function loadData() {
+            // Load scheduled notifications
+            loadScheduledNotifications();
+            
             // Load users
             const usersRes = await fetch(API_URL + '/api/admin/users', {
                 headers: { 'Authorization': 'Bearer ' + authToken }
@@ -2545,10 +2752,135 @@ ADMIN_HTML = """
             const data = await res.json();
             
             document.getElementById('notifResult').innerHTML = `
-                <div class="alert alert-success">Notifica inviata a ${data.sent} utenti (${data.errors} errori)</div>
+                <div class="alert alert-success">
+                    📱 iOS: ${data.sent_ios || 0} | 🤖 Android: ${data.sent_android || 0} | ❌ Errori: ${data.errors || 0}
+                </div>
             `;
             document.getElementById('notifTitle').value = '';
             document.getElementById('notifBody').value = '';
+        }
+
+        async function scheduleNotification() {
+            const title = document.getElementById('schedNotifTitle').value;
+            const body = document.getElementById('schedNotifBody').value;
+            const date = document.getElementById('schedDate').value;
+            const time = document.getElementById('schedTime').value;
+            
+            if (!title || !body || !date || !time) {
+                alert('Inserisci tutti i campi: titolo, messaggio, data e ora');
+                return;
+            }
+            
+            const scheduledAt = `${date}T${time}:00`;
+            
+            try {
+                const res = await fetch(API_URL + '/api/admin/schedule-notification', {
+                    method: 'POST',
+                    headers: { 
+                        'Authorization': 'Bearer ' + authToken,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ title, body, scheduled_at: scheduledAt })
+                });
+                const data = await res.json();
+                
+                if (res.ok) {
+                    document.getElementById('schedResult').innerHTML = `
+                        <div class="alert alert-success">✅ Notifica programmata per ${date} alle ${time}</div>
+                    `;
+                    document.getElementById('schedNotifTitle').value = '';
+                    document.getElementById('schedNotifBody').value = '';
+                    document.getElementById('schedDate').value = '';
+                    document.getElementById('schedTime').value = '';
+                    loadScheduledNotifications();
+                } else {
+                    document.getElementById('schedResult').innerHTML = `
+                        <div class="alert alert-danger">❌ ${data.detail || 'Errore'}</div>
+                    `;
+                }
+            } catch (e) {
+                document.getElementById('schedResult').innerHTML = `
+                    <div class="alert alert-danger">❌ Errore di connessione</div>
+                `;
+            }
+        }
+
+        async function loadScheduledNotifications() {
+            try {
+                const res = await fetch(API_URL + '/api/admin/scheduled-notifications', {
+                    headers: { 'Authorization': 'Bearer ' + authToken }
+                });
+                const notifications = await res.json();
+                
+                const pending = notifications.filter(n => !n.sent);
+                const sent = notifications.filter(n => n.sent);
+                
+                let html = '';
+                
+                if (pending.length > 0) {
+                    html += '<h4 style="color: #FFD700; margin-bottom: 10px;">⏳ In attesa</h4>';
+                    pending.forEach(n => {
+                        const schedDate = new Date(n.scheduled_at);
+                        html += `
+                            <div class="user-item">
+                                <div class="user-info">
+                                    <div class="user-name">${n.title}</div>
+                                    <div class="user-email">${n.body}</div>
+                                    <div style="color: #FFD700; font-size: 12px; margin-top: 5px;">
+                                        📅 ${schedDate.toLocaleDateString('it-IT')} alle ${schedDate.toLocaleTimeString('it-IT', {hour: '2-digit', minute:'2-digit'})}
+                                    </div>
+                                </div>
+                                <button class="btn btn-secondary" onclick="deleteScheduledNotification('${n.notification_id}')" title="Cancella">🗑️</button>
+                            </div>
+                        `;
+                    });
+                }
+                
+                if (sent.length > 0) {
+                    html += '<h4 style="color: #888; margin: 20px 0 10px 0;">✅ Inviate</h4>';
+                    sent.slice(0, 5).forEach(n => {
+                        const sentDate = new Date(n.sent_at);
+                        html += `
+                            <div class="user-item" style="opacity: 0.6;">
+                                <div class="user-info">
+                                    <div class="user-name">${n.title}</div>
+                                    <div class="user-email" style="font-size: 11px;">
+                                        ${sentDate.toLocaleDateString('it-IT')} - iOS: ${n.result?.sent_ios || 0}, Android: ${n.result?.sent_android || 0}
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                }
+                
+                if (!html) {
+                    html = '<p style="color:#888">Nessuna notifica programmata</p>';
+                }
+                
+                document.getElementById('scheduledList').innerHTML = html;
+            } catch (e) {
+                console.log('Error loading scheduled notifications:', e);
+            }
+        }
+
+        async function deleteScheduledNotification(notificationId) {
+            if (!confirm('Vuoi cancellare questa notifica programmata?')) return;
+            
+            try {
+                const res = await fetch(API_URL + '/api/admin/scheduled-notifications/' + notificationId, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': 'Bearer ' + authToken }
+                });
+                
+                if (res.ok) {
+                    loadScheduledNotifications();
+                } else {
+                    const data = await res.json();
+                    alert('Errore: ' + (data.detail || 'Errore sconosciuto'));
+                }
+            } catch (e) {
+                alert('Errore di connessione');
+            }
         }
 
         async function addBook() {
